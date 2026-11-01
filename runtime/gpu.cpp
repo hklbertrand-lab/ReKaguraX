@@ -2,6 +2,9 @@
 // Pas encore de rendu : les dessins sont ignorés. Sémantique des paquets reprise de Xenia (command_processor.cc).
 #include "guest.h"
 #include <chrono>
+#include <map>
+#include <set>
+#include <string>
 #include <thread>
 
 static uint32_t s_regs[0x8000];
@@ -85,6 +88,51 @@ struct Reader
 
 static void ExecuteIndirect(uint32_t addr, uint32_t sizeDwords);
 
+// Statistiques (IKARUGA_GPUSTATS=1) pour dimensionner le moteur de rendu
+static struct
+{
+    uint32_t draws = 0, indexed = 0;
+    std::map<uint32_t, uint32_t> prims;          // type de primitive -> nombre
+    std::set<uint64_t> shaders[2];               // hachages vertex / pixel
+    std::set<uint32_t> colorFormats, texFormats;
+    std::map<uint32_t, uint32_t> opcodes;
+} s_stats;
+
+static uint64_t HashGuest(uint32_t addr, uint32_t bytes)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < bytes; i++) h = (h ^ g_base[addr + i]) * 1099511628211ull;
+    return h;
+}
+
+static void RecordDraw(uint32_t initiator)
+{
+    s_stats.draws++;
+    s_stats.prims[initiator & 0x3F]++;
+    if (((initiator >> 6) & 3) == 0) s_stats.indexed++;
+    s_stats.colorFormats.insert((s_regs[0x2001] >> 16) & 0xF);   // RB_COLOR_INFO.format
+    for (uint32_t t = 0; t < 32; t++)
+    {
+        uint32_t d0 = s_regs[0x4800 + t * 6];
+        if ((d0 & 3) == 2) s_stats.texFormats.insert(s_regs[0x4800 + t * 6 + 1] & 0x3F);   // fetch texture : format
+    }
+}
+
+void GpuPrintStats()
+{
+    static bool on = getenv("IKARUGA_GPUSTATS");
+    if (!on) return;
+    std::string prims, cf, tf, ops;
+    for (auto& [k, v] : s_stats.prims) prims += std::to_string(k) + ":" + std::to_string(v) + " ";
+    for (auto f : s_stats.colorFormats) cf += std::to_string(f) + " ";
+    for (auto f : s_stats.texFormats) tf += std::to_string(f) + " ";
+    for (auto& [k, v] : s_stats.opcodes) { char b[32]; snprintf(b, sizeof b, "%02X:%u ", k, v); ops += b; }
+    KLOG("GPU stats : %u dessins (%u indexés), primitives [%s], shaders VS=%zu PS=%zu, formats RT [%s], textures [%s]",
+        s_stats.draws, s_stats.indexed, prims.c_str(), s_stats.shaders[0].size(), s_stats.shaders[1].size(), cf.c_str(), tf.c_str());
+    KLOG("GPU opcodes : %s", ops.c_str());
+    s_stats.draws = s_stats.indexed = 0; s_stats.prims.clear(); s_stats.opcodes.clear();
+}
+
 static void ExecutePacket(Reader& r)
 {
     uint32_t packet = r.Read();
@@ -108,6 +156,7 @@ static void ExecutePacket(Reader& r)
     }
 
     uint32_t opcode = (packet >> 8) & 0x7F, count = ((packet >> 16) & 0x3FFF) + 1;
+    s_stats.opcodes[opcode]++;
     uint32_t end = r.pos;
     r.Skip(count); uint32_t next = r.pos; r.pos = end;   // position du paquet suivant
 
@@ -184,8 +233,44 @@ static void ExecutePacket(Reader& r)
         for (uint32_t n = 0; n < 6; n++) if (mask & (1u << n)) GpuDispatchInterrupt(1, n);
         break;
     }
-    case 0x22: case 0x36:   // DRAW_INDX(_2) : pas encore de rendu
+    case 0x22:   // DRAW_INDX : (viz query, initiateur, ...)
+        r.Read(); RecordDraw(r.Read());
         break;
+    case 0x36:   // DRAW_INDX_2 : (initiateur, données inline)
+        RecordDraw(r.Read());
+        break;
+    case 0x2D:   // SET_CONSTANT : écrit une suite de registres (ALU, fetch, bool, loop, registres)
+    {
+        uint32_t info = r.Read(), index = info & 0x7FF;
+        static const uint32_t bases[] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+        uint32_t type = (info >> 16) & 0xFF;
+        for (uint32_t i = 0; i + 1 < count; i++) WriteRegister((type < 5 ? bases[type] : 0x2000) + index + i, r.Read());
+        break;
+    }
+    case 0x2F:   // LOAD_ALU_CONSTANT : copie depuis la mémoire
+    {
+        uint32_t addr = r.Read() & 0x3FFFFFFF, info = r.Read(), size = r.Read() & 0xFFF;
+        static const uint32_t bases[] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
+        uint32_t type = (info >> 16) & 0xFF, index = info & 0x7FF;
+        for (uint32_t i = 0; i < size; i++) WriteRegister((type < 5 ? bases[type] : 0x2000) + index + i, Rd32(Phys(addr + i * 4)));
+        break;
+    }
+    case 0x27:   // IM_LOAD : shader en mémoire (adresse | type, début << 16 | taille)
+    {
+        uint32_t addrType = r.Read(), size = r.Read() & 0xFFFF;
+        s_stats.shaders[(addrType & 3) == 1].insert(HashGuest(Phys(addrType & ~3u), size * 4));
+        break;
+    }
+    case 0x2B:   // IM_LOAD_IMMEDIATE : shader inline
+    {
+        uint32_t type = r.Read() & 3, size = r.Read() & 0xFFFF;
+        uint32_t pos = r.pos;
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < size; i++) h = (h ^ r.Read()) * 1099511628211ull;
+        s_stats.shaders[type == 1].insert(h);
+        r.pos = pos;
+        break;
+    }
     default:
         break;
     }

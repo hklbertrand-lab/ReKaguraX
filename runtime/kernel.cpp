@@ -661,6 +661,7 @@ void GpuInitializeRingBuffer(uint32_t base, uint32_t sizeLog2);
 void GpuEnableReadPointerWriteBack(uint32_t addr);
 void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx);
 void GpuOnSwap();
+void GpuPrintStats();
 KFUNC(VdInitializeRingBuffer) { GpuInitializeRingBuffer(ARG(3), ARG(4)); }
 KFUNC(VdEnableRingBufferRPtrWriteBack) { GpuEnableReadPointerWriteBack(ARG(3)); }
 
@@ -697,6 +698,7 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
 {
     for (uint32_t i = 0; i < 64; i++) Wr32(ARG(3) + i * 4, 0x80000000);   // paquets type 2 (NOP)
     GpuOnSwap();
+    if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());
     RET(0);
 }

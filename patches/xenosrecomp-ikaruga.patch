@@ -1,0 +1,84 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..1728091 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -134,7 +134,13 @@ int main(int argc, char** argv)
+ #endif
+ 
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+-                assert(spirv != nullptr);
++                if (spirv == nullptr)
++                {
++                    // Ikaruga : shader non compilable (ex. textures 1D) -> ignoré et signalé
++                    fmt::println(stderr, "XenosRecomp : échec de compilation du shader {:X}", hashShaderPair.first);
++                    ++progress;
++                    return;
++                }
+ 
+                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+                 assert(result);
+diff --git a/XenosRecomp/pch.h b/XenosRecomp/pch.h
+index e59682c..0ac377b 100644
+--- a/XenosRecomp/pch.h
++++ b/XenosRecomp/pch.h
+@@ -5,6 +5,13 @@
+ #endif
+ 
+ #include <dxcapi.h>
++#ifdef __MINGW32__
++// MinGW : __uuidof a besoin de déclarations explicites pour les interfaces DXC
++__CRT_UUID_DECL(IDxcBlob, 0x8BA5FB08, 0x5195, 0x40e2, 0xAC, 0x58, 0x0D, 0x98, 0x9C, 0x3A, 0x01, 0x02)
++__CRT_UUID_DECL(IDxcBlobUtf8, 0x3DA636C9, 0xBA71, 0x4024, 0xA3, 0x01, 0x30, 0xCB, 0xF1, 0x25, 0x30, 0x5B)
++__CRT_UUID_DECL(IDxcResult, 0x58346CDA, 0xDDE7, 0x4497, 0x94, 0x61, 0x6F, 0x87, 0xAF, 0x5E, 0x06, 0x59)
++__CRT_UUID_DECL(IDxcCompiler3, 0x228B4687, 0x5A6A, 0x4730, 0x90, 0x0C, 0x97, 0x02, 0xB2, 0x20, 0x3F, 0x54)
++#endif
+ 
+ #include <bit>
+ #include <cassert>
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..466e404 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -177,7 +177,22 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     out += " = ";
+ 
+     auto findResult = vertexElements.find(address);
+-    assert(findResult != vertexElements.end());
++    if (findResult == vertexElements.end())
++    {
++        // Ikaruga : fetch sans déclaration (mini-fetch / fetch partagé) -> valeur neutre, signalée
++        fmt::println(stderr, "XenosRecomp : vfetch sans déclaration à l'adresse {}", address);
++        out += "float4(0.0, 0.0, 0.0, 1.0).";
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
+ 
+     switch (findResult->second.usage)
+     {
+@@ -626,8 +641,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             default:
+             {
+                 auto findResult = interpolators.find(instr.vectorDest);
+-                assert(findResult != interpolators.end());
+-                exportRegister = findResult->second;
++                // Ikaruga : export vers un interpolateur non déclaré -> variable locale ignorée
++                exportRegister = findResult != interpolators.end() ? std::string_view(findResult->second) : std::string_view("oUnused");
+                 break;
+             }
+             }
+@@ -1479,6 +1494,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    out += "\tfloat4 oUnused = 0.0;\n";
+     out += "\tint a0 = 0;\n";
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
