@@ -661,6 +661,7 @@ void GpuInitializeRingBuffer(uint32_t base, uint32_t sizeLog2);
 void GpuEnableReadPointerWriteBack(uint32_t addr);
 void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx);
 void GpuOnSwap();
+void VulkanPresent(float r, float g, float b);
 void GpuPrintStats();
 KFUNC(VdInitializeRingBuffer) { GpuInitializeRingBuffer(ARG(3), ARG(4)); }
 KFUNC(VdEnableRingBufferRPtrWriteBack) { GpuEnableReadPointerWriteBack(ARG(3)); }
@@ -698,6 +699,11 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
 {
     for (uint32_t i = 0; i < 64; i++) Wr32(ARG(3) + i * 4, 0x80000000);   // paquets type 2 (NOP)
     GpuOnSwap();
+    {
+        // Pas encore de rendu : couleur qui pulse pour prouver que chaque VdSwap arrive à l'écran
+        float t = float(s_frames % 120) / 120.0f;
+        VulkanPresent(0.1f, 0.1f + 0.3f * (t < 0.5f ? t * 2 : 2 - t * 2), 0.3f);
+    }
     if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());
     RET(0);

@@ -1,5 +1,6 @@
 // Ikaruga recompilé : point d'entrée, mémoire invitée, chargement du XEX, fenêtre SDL3
 #include "guest.h"
+#include "vulkan.h"
 #include <image.h>
 #include <xex.h>
 #include <string>
@@ -196,6 +197,7 @@ int main(int argc, char** argv)
 
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO);
     g_window = SDL_CreateWindow("Ikaruga", 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    if (!VulkanInit(g_window)) fprintf(stderr, "Vulkan indisponible : pas d'affichage\n");
 
 #ifdef _WIN32
     if (const char* w = getenv("IKARUGA_WATCH"))

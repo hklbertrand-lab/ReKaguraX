@@ -22,11 +22,14 @@ find_package(SDL3 REQUIRED CONFIG)
 file(GLOB PPC_SOURCES ${CMAKE_SOURCE_DIR}/ppc/*.cpp)
 file(GLOB RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/*.cpp)
 
-add_executable(ikaruga ${RUNTIME_SOURCES} ${PPC_SOURCES})
+add_executable(ikaruga ${RUNTIME_SOURCES} ${PPC_SOURCES} ${CMAKE_SOURCE_DIR}/thirdparty/volk/volk.c)
 target_include_directories(ikaruga PRIVATE
     ${CMAKE_SOURCE_DIR}/ppc
     ${CMAKE_SOURCE_DIR}/runtime
-    ${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp/thirdparty/simde)
+    ${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp/thirdparty/simde
+    ${CMAKE_SOURCE_DIR}/thirdparty/volk
+    ${CMAKE_SOURCE_DIR}/thirdparty/Vulkan-Headers/include)
+target_compile_definitions(ikaruga PRIVATE VK_NO_PROTOTYPES)
 target_link_libraries(ikaruga PRIVATE XenonUtils SDL3::SDL3)
 target_compile_options(ikaruga PRIVATE -march=x86-64-v3 -Wno-unused-label -Wno-unused-variable)
 set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
