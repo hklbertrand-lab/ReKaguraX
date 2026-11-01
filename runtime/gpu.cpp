@@ -39,6 +39,7 @@ static uint32_t MemRead(uint32_t addr) { return GpuSwap(__builtin_bswap32(Rd32(P
 void GpuDispatchInterrupt(uint32_t source, uint32_t cpu)
 {
     if (!s_interruptCallback) return;
+    Wr8(s_ctx.r13.u32 + 0x10C, (uint8_t)cpu);   // processeur courant vu par le gestionnaire
     s_ctx.r3.u64 = source;
     s_ctx.r4.u64 = s_interruptCallbackCtx;
     GuestCall(s_ctx, s_interruptCallback);
@@ -127,7 +128,7 @@ static void ExecutePacket(Reader& r)
                 s_regs[REG_COHER_STATUS_HOST] &= ~0x80000000u;   // "MakeCoherent" : rien à synchroniser chez nous
             uint32_t v = (info & 0x10) ? MemRead(addr) : s_regs[addr & 0x7FFF];
             if (Compare(info, v & mask, ref)) break;
-            if (spins > 2000000) { KLOG("GPU : WAIT_REG_MEM bloqué (%08X & %08X vs %08X)", v, mask, ref); break; }
+            if (spins > 2000000) { KLOG("GPU : WAIT_REG_MEM bloqué info=%X addr=%08X (%08X & %08X vs %08X)", info, addr, v, mask, ref); break; }
             std::this_thread::yield();
         }
         break;
@@ -211,8 +212,22 @@ static void GpuThread()
     }
 }
 
+// Registres MMIO que le jeu lit directement en mémoire : valeurs fixes reprises de Xenia (ReadRegister)
+static void InitMmio()
+{
+    static std::once_flag once;
+    std::call_once(once, [] {
+        Wr32(MMIO_BASE + 0x0F00 * 4, 0x08100748);   // RB_EDRAM_TIMING
+        Wr32(MMIO_BASE + 0x0F01 * 4, 0x0000200E);   // RB_BC_CONTROL
+        Wr32(MMIO_BASE + 0x194C * 4, 0x000002D0);   // D1MODE_V_COUNTER
+        Wr32(MMIO_BASE + 0x1951 * 4, 1);            // statut d'interruption : vblank
+        Wr32(MMIO_BASE + 0x1961 * 4, 0x050002D0);   // D1MODE_VIEWPORT_SIZE 1280x720
+    });
+}
+
 void GpuInitializeRingBuffer(uint32_t base, uint32_t sizeLog2)
 {
+    InitMmio();
     s_ringBase = base;
     s_ringSize = 1u << (sizeLog2 + 3);
     s_rptr = 0;
@@ -221,5 +236,5 @@ void GpuInitializeRingBuffer(uint32_t base, uint32_t sizeLog2)
 }
 
 void GpuEnableReadPointerWriteBack(uint32_t addr) { s_rptrWriteBack = Phys(addr); }
-void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx) { s_interruptCallback = cb; s_interruptCallbackCtx = ctx; }
+void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx) { InitMmio(); s_interruptCallback = cb; s_interruptCallbackCtx = ctx; }
 void GpuOnSwap() { s_swapCounter++; }

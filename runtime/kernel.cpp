@@ -682,6 +682,7 @@ KFUNC(VdSetGraphicsInterruptCallback)
                 std::this_thread::sleep_until(next);
                 if (uint32_t cb = s_gfxCallback)
                 {
+                    Wr8(ctx.r13.u32 + 0x10C, 2);   // Xenia livre le vblank sur le processeur 2
                     ctx.r3.u64 = 0;   // source : vblank
                     ctx.r4.u64 = s_gfxCallbackCtx;
                     GuestCall(ctx, cb);

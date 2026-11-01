@@ -2,6 +2,17 @@
 #include "guest.h"
 #include <initializer_list>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+static void DumpHostStack()
+{
+    void* frames[16]; USHORT n = CaptureStackBackTrace(0, 16, frames, nullptr);
+    for (USHORT i = 0; i < n; i++)
+        fprintf(stderr, "[watch]   pile exe+%llX\n",(unsigned long long)((uint8_t*)frames[i] - (uint8_t*)GetModuleHandleW(nullptr)));
+}
+#else
+static void DumpHostStack() {}
+#endif
 
 extern "C" PPC_FUNC(__imp__sub_82174280);
 PPC_FUNC(sub_82174280)
@@ -96,6 +107,17 @@ PPC_FUNC(sub_822ACBD8)
     if (c++ < 5)
         KLOG("jpeg cinfo=%08X state=%u err=%08X error_exit=%08X emit=%08X src=%08X", cinfo, Rd32(cinfo + 420), err,
             err ? Rd32(err) : 0, err ? Rd32(err + 4) : 0, Rd32(cinfo + 24));
+    if (c == 1) DumpHostStack();
     __imp__sub_822ACBD8(ctx, base);
     if (err && c < 6) KLOG("  -> msg_code=%u", Rd32(err + 20));
+}
+
+// error_exit de libjpeg : affiche le code d'erreur (msg_code à err+20)
+extern "C" PPC_FUNC(__imp__sub_82247648);
+PPC_FUNC(sub_82247648)
+{
+    uint32_t cinfo = ctx.r3.u32, err = Rd32(cinfo);
+    KLOG("libjpeg error_exit : msg_code=%u parm=%u,%u", Rd32(err + 20), Rd32(err + 24), Rd32(err + 28));
+    DumpHostStack();
+    __imp__sub_82247648(ctx, base);
 }

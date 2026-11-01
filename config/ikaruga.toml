@@ -24,5 +24,9 @@ savevmx_14_address   = 0x8267D410
 restvmx_64_address   = 0x8267D73C
 savevmx_64_address   = 0x8267D4A4
 
+# setjmp/longjmp du CRT : remplacés par ceux de l'hôte (libjpeg s'en sert pour ses erreurs)
+setjmp_address  = 0x8267E790
+longjmp_address = 0x8267E350
+
 # Petit stub (mtctr/bctr) collé après __restgprlr_31, sinon nommé en double __restgprlr_30
 functions = [ { address = 0x821E0074, size = 0x14 } ]
