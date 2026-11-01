@@ -1,0 +1,165 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..c014d39 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -2249,6 +2249,160 @@ bool Recompiler::Recompile(
+ 
+         break;
+ 
++    // --- Added for Ikaruga ---
++    case PPC_INST_CRAND:
++    {
++        constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
++        println("	{}.{} = {}.{} && {}.{};", cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], cr(insn.operands[1] / 4), fields[insn.operands[1] % 4], cr(insn.operands[2] / 4), fields[insn.operands[2] % 4]);
++        break;
++    }
++
++    case PPC_INST_CROR:
++    {
++        constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
++        println("	{}.{} = {}.{} || {}.{};", cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], cr(insn.operands[1] / 4), fields[insn.operands[1] % 4], cr(insn.operands[2] / 4), fields[insn.operands[2] % 4]);
++        break;
++    }
++
++    case PPC_INST_CRORC:
++    {
++        constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
++        println("	{}.{} = {}.{} || !{}.{};", cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], cr(insn.operands[1] / 4), fields[insn.operands[1] % 4], cr(insn.operands[2] / 4), fields[insn.operands[2] % 4]);
++        break;
++    }
++
++    case PPC_INST_CRNOR:
++    {
++        constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
++        println("	{}.{} = !({}.{} || {}.{});", cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], cr(insn.operands[1] / 4), fields[insn.operands[1] % 4], cr(insn.operands[2] / 4), fields[insn.operands[2] % 4]);
++        break;
++    }
++
++    case PPC_INST_CRXOR:
++    {
++        constexpr std::string_view fields[] = { "lt", "gt", "eq", "so" };
++        println("	{}.{} = {}.{} != {}.{};", cr(insn.operands[0] / 4), fields[insn.operands[0] % 4], cr(insn.operands[1] / 4), fields[insn.operands[1] % 4], cr(insn.operands[2] / 4), fields[insn.operands[2] % 4]);
++        break;
++    }
++
++    case PPC_INST_EQV:
++        println("	{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("	{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
++    case PPC_INST_VADDSBS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_adds_epi8(simde_mm_load_si128((simde__m128i*){}.s8), simde_mm_load_si128((simde__m128i*){}.s8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBSBS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_subs_epi8(simde_mm_load_si128((simde__m128i*){}.s8), simde_mm_load_si128((simde__m128i*){}.s8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBSHS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_subs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSUBUBM:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VAVGUH:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_avg_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMAXSH:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_max_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMINSH:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_min_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VANDC:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSWSS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSWUS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packus_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKSHSS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packs_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKUHUS:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packus_epi16(simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF)), simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF))));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VCMPEQUH:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpeq_epi16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("	{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCMPGTSH:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi16(simde_mm_load_si128((simde__m128i*){}.s16), simde_mm_load_si128((simde__m128i*){}.s16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("	{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCMPGTSW:
++        println("	simde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("	{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        for (size_t i = 0; i < 4; i++)
++            println("	{}.s32[{}] = [&]{{ int64_t s = int64_t({}.s32[{}]) + {}.s32[{}]; return int32_t(s > 0x7FFFFFFF ? 0x7FFFFFFF : s < -0x80000000LL ? -0x80000000LL : s); }}();", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSPLTISH:
++        println("	simde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(short(0x{:X})));", v(insn.operands[0]), insn.operands[1] & 0xFFFF);
++        break;
++
++    case PPC_INST_VSLH:
++        for (size_t i = 0; i < 8; i++)
++            println("	{}.u16[{}] = {}.u16[{}] << ({}.u16[{}] & 0xF);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRH:
++        for (size_t i = 0; i < 8; i++)
++            println("	{}.u16[{}] = {}.u16[{}] >> ({}.u16[{}] & 0xF);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRAH:
++        for (size_t i = 0; i < 8; i++)
++            println("	{}.s16[{}] = {}.s16[{}] >> ({}.u16[{}] & 0xF);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSRAB:
++        for (size_t i = 0; i < 16; i++)
++            println("	{}.s8[{}] = {}.s8[{}] >> ({}.u8[{}] & 0x7);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VRLH:
++        for (size_t i = 0; i < 8; i++)
++            println("	{}.u16[{}] = uint16_t(({}.u16[{}] << ({}.u16[{}] & 0xF)) | ({}.u16[{}] >> ((16 - ({}.u16[{}] & 0xF)) & 0xF)));", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
++        break;
++
++    case PPC_INST_VSLO:
++        // Whole-register shift left by octets; BE byte 15 is LE byte 0. Registers are stored reversed,
++        // so a BE left shift moves bytes towards higher LE indices.
++        println("	{{ uint8_t sh = ({}.u8[0] >> 3) & 0xF; PPCVRegister t = {}; for (int i = 0; i < 16; i++) {}.u8[i] = i >= sh ? t.u8[i - sh] : 0; }}", v(insn.operands[2]), v(insn.operands[1]), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VCTUXS:
++        printSetFlushMode(true);
++        for (size_t i = 0; i < 4; i++)
++            println("	{{ float f = {}.f32[{}] * {}.0f; {}.u32[{}] = f != f ? 0 : f >= 4294967295.0f ? 0xFFFFFFFF : f <= 0.0f ? 0 : uint32_t(f); }}", v(insn.operands[1]), i, 1u << insn.operands[2], v(insn.operands[0]), i);
++        break;
++
+     case PPC_INST_XOR:
+         println("\t{}.u64 = {}.u64 ^ {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))

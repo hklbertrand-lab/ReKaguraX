@@ -1,0 +1,6 @@
+# Contenu du jeu (protégé) et sorties générées : jamais dans git
+extracted/
+ppc/
+thirdparty/
+build/
+__pycache__/

@@ -1,0 +1,28 @@
+# Configuration XenonRecomp pour Ikaruga (XBLA, Title ID 58410878)
+# default.xex : XEX2, chiffré (AES retail) + compression LZX, base 0x82000000, image 0x820000, entry 0x8217ba20
+[main]
+file_path = "../extracted/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "ikaruga_switch_tables.toml"   # produit par XenonAnalyse
+
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Adresses des helpers de sauvegarde/restauration (trouvées par tools/find_helpers.py)
+restgprlr_14_address = 0x821E0020
+savegprlr_14_address = 0x821DFFD0
+restfpr_14_address   = 0x821E02AC
+savefpr_14_address   = 0x821E0260
+restvmx_14_address   = 0x8267D6A8
+savevmx_14_address   = 0x8267D410
+restvmx_64_address   = 0x8267D73C
+savevmx_64_address   = 0x8267D4A4
+
+# Petit stub (mtctr/bctr) collé après __restgprlr_31, sinon nommé en double __restgprlr_30
+functions = [ { address = 0x821E0074, size = 0x14 } ]
