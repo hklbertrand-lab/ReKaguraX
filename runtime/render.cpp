@@ -48,7 +48,9 @@ static Image s_white;
 
 struct ColorTarget { Image image; VkFormat format; uint32_t width, height; };
 struct DepthTarget { Image image; uint32_t width, height; };
-struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0; };
+struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0, bpp = 4; };
+struct TextureFormatInfo { VkFormat vk; uint32_t blockSize, bytesPerBlock; };
+static TextureFormatInfo TextureFormat(uint32_t fmt);
 static std::unordered_map<uint64_t, ColorTarget> s_colorTargets;       // (base EDRAM, format, pitch)
 static std::unordered_map<uint64_t, DepthTarget> s_depthTargets;       // (base EDRAM, taille)
 static std::unordered_map<uint32_t, VkRenderPass> s_renderPasses;      // par format couleur (+ profondeur D32S8)
@@ -545,24 +547,61 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
 
 static uint32_t s_nextDescriptor = 1;   // 0 = texture de remplacement
 
-static void Resolve(const uint32_t* regs)
+static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
 {
     EndRenderPass();
+    // Rectangle du resolve : 3 sommets (x, y) flottants big-endian désignés par la constante de fetch 0
+    uint32_t va = regs[FETCH_CONSTANTS] & 0x1FFFFFFC;
+    float v[6] = {};
+    for (int i = 0; i < 6; i++) { uint32_t w = __builtin_bswap32(*(const uint32_t*)(g_base + phys(va + i * 4))); memcpy(&v[i], &w, 4); }
+    static uint64_t logFrom = getenv("IKARUGA_RESOLVELOG") ? strtoull(getenv("IKARUGA_RESOLVELOG"), nullptr, 10) : 0;
+    extern uint64_t g_presentCount;
+    static int logged;
+    if (logFrom && g_presentCount >= logFrom && logged++ < 200)
+    {
+        KLOG("resolve img=%llu woff=%08X sc=%08X/%08X mode=%08X surf=%08X color=%08X ctl=%08X dest=%08X pitch=%08X info=%08X rect=(%.0f,%.0f)(%.0f,%.0f)(%.0f,%.0f)",
+            (unsigned long long)g_presentCount, regs[0x2080], regs[PA_SC_WINDOW_SCISSOR_TL], regs[PA_SC_WINDOW_SCISSOR_BR], regs[PA_SU_SC_MODE_CNTL],
+            regs[RB_SURFACE_INFO], regs[RB_COLOR_INFO], regs[RB_COPY_CONTROL], regs[RB_COPY_DEST_BASE], regs[RB_COPY_DEST_PITCH], regs[0x231B],
+            v[0], v[1], v[2], v[3], v[4], v[5]);
+    }
     uint32_t control = regs[RB_COPY_CONTROL];
     ColorTarget& color = GetColorTarget(regs);
     DepthTarget& depth = GetDepthTarget(regs, color.width, color.height);
     uint32_t source = control & 7, command = (control >> 20) & 3;
     uint32_t destBase = regs[RB_COPY_DEST_BASE] & 0x1FFFFFFF, destPitch = regs[RB_COPY_DEST_PITCH] & 0x3FFF;
     uint32_t destHeight = (regs[RB_COPY_DEST_PITCH] >> 16) & 0x3FFF;
-    uint32_t w = std::min(destPitch ? destPitch : color.width, color.width), h = std::min(destHeight ? destHeight : 720u, color.height);
+    uint32_t w = destPitch ? destPitch : color.width, h = std::min(destHeight ? destHeight : 720u, kTargetHeight);
 
-    if (source < 4 && command != 3 && destBase && w && h)
+    // Rendu par tuiles : chaque tuile est dessinée à sa place dans la cible hôte (assez grande, on n'applique pas
+    // PA_SC_WINDOW_OFFSET), puis copiée vers une base décalée d'autant de lignes dans la même texture invitée.
+    int32_t x0 = int32_t(std::min({ v[0], v[2], v[4] })), y0 = int32_t(std::min({ v[1], v[3], v[5] }));
+    int32_t x1 = int32_t(std::max({ v[0], v[2], v[4] })), y1 = int32_t(std::max({ v[1], v[3], v[5] }));
+    if (x1 <= x0 || y1 <= y0) { x0 = y0 = 0; x1 = int32_t(w); y1 = int32_t(h); }
+    x0 = std::clamp(x0, 0, int32_t(color.width)); x1 = std::clamp(x1, x0, int32_t(color.width));
+    y0 = std::clamp(y0, 0, int32_t(color.height)); y1 = std::clamp(y1, y0, int32_t(color.height));
+    int32_t dx = x0, dy = y0;
+    if (regs[PA_SU_SC_MODE_CNTL] & (1 << 16))   // vtx_window_offset_enable : position dans la tuile
     {
-        Resolved& r = s_resolved[destBase];
+        uint32_t woff = regs[0x2080];
+        dx += int32_t(woff << 17) >> 17; dy += int32_t(woff << 1) >> 17;
+    }
+    uint32_t bpp = TextureFormat((regs[0x231B] >> 7) & 0x3F).bytesPerBlock;
+    if (!bpp) bpp = 4;
+    uint32_t key = destBase;
+    for (auto& [base, res] : s_resolved)   // base décalée à l'intérieur d'une copie existante (tuile suivante)
+    {
+        uint32_t row = res.width * res.bpp;
+        if (base < destBase && res.image.image && row && destBase < base + row * res.height && (destBase - base) % row == 0)
+        { key = base; dy += int32_t((destBase - base) / row); w = res.width; h = res.height; break; }
+    }
+
+    if (source < 4 && command != 3 && destBase && w && h && x1 > x0 && y1 > y0)
+    {
+        Resolved& r = s_resolved[key];
         if (!r.image.image || r.width != w || r.height != h || r.format != color.format)
         {
             r.image = CreateImage(w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, color.format);
-            r.width = w; r.height = h; r.format = color.format;
+            r.width = w; r.height = h; r.format = color.format; r.bpp = bpp;
             if (!r.descriptor) r.descriptor = s_nextDescriptor++;
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
@@ -573,10 +612,14 @@ static void Resolve(const uint32_t* regs)
         Transition(r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copy.extent = { w, h, 1 };
-        vkCmdCopyImage(s_cmd, color.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        dx = std::max(dx, 0); dy = std::max(dy, 0);
+        copy.srcOffset = { x0, y0, 0 };
+        copy.dstOffset = { dx, dy, 0 };
+        copy.extent = { uint32_t(std::min(x1 - x0, int32_t(w) - dx)), uint32_t(std::min(y1 - y0, int32_t(h) - dy)), 1 };
+        if (int32_t(copy.extent.width) > 0 && int32_t(copy.extent.height) > 0)
+            vkCmdCopyImage(s_cmd, color.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         Transition(r.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        s_lastResolved = destBase;
+        s_lastResolved = key;
     }
     if (control & (1 << 8))   // effacement couleur
     {
@@ -597,8 +640,6 @@ static void Resolve(const uint32_t* regs)
 }
 
 // ------------------------------------------------------------------ textures
-
-struct TextureFormatInfo { VkFormat vk; uint32_t blockSize, bytesPerBlock; };
 
 static TextureFormatInfo TextureFormat(uint32_t fmt)
 {
@@ -767,7 +808,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
             regs[RB_COPY_CONTROL], regs[RB_COLOR_CLEAR]);
     if (!BeginCommands()) return;
     uint32_t edramMode = regs[RB_MODECONTROL] & 7;
-    if (edramMode == 6) { Resolve(regs); return; }   // mode copie : c'est un resolve
+    if (edramMode == 6) { Resolve(regs, phys); return; }   // mode copie : c'est un resolve
     if (edramMode != 4 && edramMode != 5) return;    // 4 = couleur + profondeur, 5 = profondeur seule
     if (!s_vs || !s_ps) return;
 
