@@ -461,7 +461,24 @@ KFUNC(KeResumeThread)
 
 KFUNC(ExTerminateThread) { KLOG("ExTerminateThread(%u)", ARG(3)); }
 KFUNC(KeSetBasePriorityThread) { RET(0); }
-KFUNC(KeSetAffinityThread) { RET(0); }
+// Affinité : le numéro de processeur courant vit dans le PCR (+0x10C) ; D3D s'en sert pour router
+// ses interruptions et autoriser la réentrance "sur le même CPU". -2 désigne le thread courant.
+KFUNC(KeSetAffinityThread)   // (thread, masque) -> ancien masque
+{
+    uint32_t pcr = 0;
+    if (ARG(3) == 0xFFFFFFFE) pcr = ctx.r13.u32;
+    else
+    {
+        std::lock_guard l(s_objMutex);
+        for (auto& [h, o] : s_handles)
+            if (auto k = std::dynamic_pointer_cast<KThread>(o); k && (h == ARG(3) || k->guestThread == ARG(3))) pcr = k->ctx.r13.u32;
+    }
+    if (!pcr || !ARG(4)) RET(0);
+    uint32_t old = 1u << Rd8(pcr + 0x10C);
+    Wr8(pcr + 0x10C, uint8_t(__builtin_ctz(ARG(4))));
+    KLOG("KeSetAffinityThread : processeur %u", __builtin_ctz(ARG(4)));
+    RET(old);
+}
 KFUNC(KeGetCurrentProcessType) { RET(1); }   // processus titre
 KFUNC(KeDelayExecutionThread)   // (mode, alertable, pInterval)
 {
@@ -818,6 +835,7 @@ void GpuEnableReadPointerWriteBack(uint32_t addr);
 void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx);
 void GpuOnSwap();
 extern std::recursive_mutex g_interruptMutex;
+std::recursive_mutex& GuestCpuLock(uint32_t cpu);
 void VulkanPresent(float r, float g, float b);
 void GpuPrintStats();
 KFUNC(VdInitializeRingBuffer) { GpuInitializeRingBuffer(ARG(3), ARG(4)); }
@@ -834,6 +852,7 @@ KFUNC(VdSetGraphicsInterruptCallback)
         std::thread([] {
             PPCContext ctx;
             GuestInitThreadContext(ctx, 0x10000);
+            DebugRegisterThread("vblank");
             auto next = std::chrono::steady_clock::now();
             for (;;)
             {
@@ -842,6 +861,7 @@ KFUNC(VdSetGraphicsInterruptCallback)
                 if (uint32_t cb = s_gfxCallback)
                 {
                     std::lock_guard lock(g_interruptMutex);   // sérialisé avec les interruptions du GPU
+                    std::lock_guard cpuLock(GuestCpuLock(2));
                     Wr8(ctx.r13.u32 + 0x10C, 2);   // Xenia livre le vblank sur le processeur 2
                     ctx.r3.u64 = 0;   // source : vblank
                     ctx.r4.u64 = s_gfxCallbackCtx;
@@ -915,6 +935,7 @@ KFUNC(XAudioRegisterRenderDriverClient)   // (callbackPtr -> {fonction, argument
         std::thread([] {
             PPCContext ctx;
             GuestInitThreadContext(ctx, 0x10000);
+            DebugRegisterThread("audio");
             auto next = std::chrono::steady_clock::now();
             while (s_audioRunning)
             {
@@ -1002,4 +1023,20 @@ KFUNC(XamUserReadProfileSettings)   // (titre, joueur, nbXuid, xuids, nb, ids, p
     KLOG("XamUserReadProfileSettings : %u réglages (non définis)", count);
     if (overlapped) RET(CompleteOverlapped(overlapped, 0, needed));
     RET(0);
+}
+
+// Interruptions par processeur : sur Xbox 360, un code qui masque les interruptions (mtmsrd, bit EE à 0)
+// ne peut pas être interrompu sur son CPU ; D3D en dépend pour ses files par CPU. On l'émule avec un
+// verrou par CPU pris tant que EE vaut 0, et que la livraison d'une interruption à ce CPU doit acquérir.
+static std::recursive_mutex s_cpuLocks[8];
+
+std::recursive_mutex& GuestCpuLock(uint32_t cpu) { return s_cpuLocks[cpu & 7]; }
+
+void GuestWriteMsr(PPCContext& ctx, uint64_t value)
+{
+    bool wasEnabled = ctx.msr & 0x8000, enabled = value & 0x8000;
+    uint32_t cpu = Rd8(ctx.r13.u32 + 0x10C) & 7;
+    if (wasEnabled && !enabled) s_cpuLocks[cpu].lock();
+    else if (!wasEnabled && enabled) s_cpuLocks[cpu].unlock();
+    ctx.msr = value;
 }

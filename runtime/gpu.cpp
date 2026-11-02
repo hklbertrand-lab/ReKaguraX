@@ -51,11 +51,13 @@ static void MemWrite(uint32_t addr, uint32_t value)
 static uint32_t MemRead(uint32_t addr) { return GpuSwap(__builtin_bswap32(Rd32(Phys(addr & ~3u))), addr & 3); }
 
 std::recursive_mutex g_interruptMutex;
+std::recursive_mutex& GuestCpuLock(uint32_t cpu);
 
 void GpuDispatchInterrupt(uint32_t source, uint32_t cpu)
 {
     if (!s_interruptCallback) return;
     std::lock_guard lock(g_interruptMutex);   // le matériel sérialise les interruptions graphiques
+    std::lock_guard cpuLock(GuestCpuLock(cpu));     // pas d'interruption pendant une section "EE = 0" de ce CPU
     Wr8(s_ctx.r13.u32 + 0x10C, (uint8_t)cpu);   // processeur courant vu par le gestionnaire
     s_ctx.r3.u64 = source;
     s_ctx.r4.u64 = s_interruptCallbackCtx;

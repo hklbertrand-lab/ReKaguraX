@@ -75,6 +75,12 @@ PPC_FUNC(sub_821600C8)
         last = std::chrono::steady_clock::now();
         KLOG("attente GPU (retour %08X) : dev=%08X fence=%08X dernière=%08X wptr=%08X rptr=%08X +13232=%08X écriture D3D=%08X +52=%08X +56=%08X cible=%08X", uint32_t(ctx.lr),
             dev, Rd32(Rd32(dev + 10896)), Rd32(dev + 10908), Rd32(0x7FC80714), Rd32(0xA020A03C), Rd32(dev + 13232), Rd32(dev + 48), Rd32(dev + 52), Rd32(dev + 56), g_fenceTarget);
+        for (uint32_t w : { 0x40004F5Cu, 0x40004FACu })
+        {
+            uint32_t sh = Rd32(w);
+            KLOG("  travailleur %08X cpu=%u file=%u/%u | partagé %08X verrou=%u masque=%08X compteur=%u +44=%u", w, Rd32(w + 4), Rd32(w + 60), Rd32(w + 56),
+                sh, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), Rd32(sh + 44));
+        }
     }
     __imp__sub_821600C8(ctx, base);
 }
@@ -115,4 +121,16 @@ PPC_FUNC(sub_82161A20)
         KLOG("attente fence : cible=%08X dernière=%08X gpu=%08X +13232=%08X r5=%08X", ctx.r4.u32, Rd32(dev + 10908),
             Rd32(Rd32(dev + 10896)), Rd32(dev + 13232), ctx.r5.u32);
     __imp__sub_82161A20(ctx, base);
+}
+
+// Processeur de commandes D3D des threads de travail : état du verrou partagé à l'entrée et à la sortie
+extern "C" PPC_FUNC(__imp__sub_82170B28);
+PPC_FUNC(sub_82170B28)
+{
+    static bool on = getenv("IKARUGA_LOCKLOG");
+    uint32_t w = ctx.r3.u32, sh = Rd32(w);
+    uint32_t cpu = Rd8(ctx.r13.u32 + 0x10C);
+    if (on) KLOG("82170B28 entrée cpu%u ctx=%08X verrou=%u masque=%08X compteur=%u file=%u/%u", cpu, w, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), Rd32(w + 60), Rd32(w + 56));
+    __imp__sub_82170B28(ctx, base);
+    if (on) KLOG("82170B28 sortie  cpu%u ctx=%08X verrou=%u masque=%08X compteur=%u r3=%u", cpu, w, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), ctx.r3.u32);
 }

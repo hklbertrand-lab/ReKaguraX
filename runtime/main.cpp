@@ -44,7 +44,8 @@ void GuestInitThreadContext(PPCContext& ctx, uint32_t stackSize)
     memset(&ctx, 0, sizeof(ctx));
     stackSize = (stackSize ? stackSize : 0x40000) + 0x1000;
     uint32_t stack = GuestAllocKernel(stackSize, 0x1000);
-    uint32_t pcr = GuestAllocKernel(0x2D8 + 0x400, 0x1000);   // KPCR + KTHREAD + slots TLS
+    // PCR alignés sur 64 Ko : le code fait "mtmsrd r13" pour masquer les interruptions, le bit EE (0x8000) doit y valoir 0
+    uint32_t pcr = GuestAllocKernel(0x2D8 + 0x400, 0x10000);   // KPCR + KTHREAD + slots TLS
     uint32_t thread = pcr + 0x2D8;
     uint32_t tls = thread + 0x200;
     static std::atomic<uint32_t> nextId = 1;
@@ -59,6 +60,7 @@ void GuestInitThreadContext(PPCContext& ctx, uint32_t stackSize)
     ctx.r1.u64 = stack + stackSize - 0x100;
     ctx.r13.u64 = pcr;
     ctx.fpscr.loadFromHost();
+    ctx.msr = 0x8000;   // interruptions autorisées (EE)
 }
 
 static bool ReserveGuestMemory()
