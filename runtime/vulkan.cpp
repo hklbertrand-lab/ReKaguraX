@@ -236,7 +236,7 @@ void VulkanImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, 
     b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
-    b.subresourceRange = { aspect, 0, 1, 0, 1 };
+    b.subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, 1 };   // tous les niveaux de mip
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 

@@ -65,7 +65,7 @@ static VkDescriptorSetLayout s_setLayouts[4];
 static VkDescriptorPool s_descPool;
 static VkDescriptorSet s_sets[4];
 static VkSampler s_sampler;
-static VkSampler s_samplers[4];   // [linéaire|point] x [clamp|wrap], indices 0-3 du tableau de samplers
+static VkSampler s_samplers[8];   // [linéaire|point] x [clamp|wrap] x [mip au plus proche|mip linéaire], indices 0-7
 static VkPipelineLayout s_pipelineLayout;
 static std::unordered_map<uint64_t, VkPipeline> s_pipelines;
 static std::unordered_map<const TranslatedShader*, VkShaderModule> s_modules;
@@ -189,11 +189,12 @@ static bool Init()
     da.pSetLayouts = s_setLayouts;
     vkAllocateDescriptorSets(s_dev, &da, s_sets);
 
-    VkDescriptorImageInfo samplerInfos[4];
-    for (int i = 0; i < 4; i++)
+    VkDescriptorImageInfo samplerInfos[8];
+    for (int i = 0; i < 8; i++)
     {
         VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         si.magFilter = si.minFilter = (i & 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+        si.mipmapMode = (i & 4) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         si.addressModeU = si.addressModeV = si.addressModeW = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = VK_LOD_CLAMP_NONE;
         vkCreateSampler(s_dev, &si, nullptr, &s_samplers[i]);
@@ -204,7 +205,7 @@ static bool Init()
     VkDescriptorImageInfo whiteInfo{ VK_NULL_HANDLE, s_white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkWriteDescriptorSet writes[2]{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &whiteInfo };
-    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[3], 0, 0, 4, VK_DESCRIPTOR_TYPE_SAMPLER, samplerInfos };
+    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[3], 0, 0, 8, VK_DESCRIPTOR_TYPE_SAMPLER, samplerInfos };
     vkUpdateDescriptorSets(s_dev, 2, writes, 0, nullptr);
 
     VkPushConstantRange push{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24 };
@@ -707,7 +708,23 @@ static uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitchAligned, uint32_t 
     return ((y & 1) << 4) | (pipe << 6) | (bank << 11) | (bytes & 15) | (((bytes >> 4) & 1) << 5) | (((bytes >> 5) & 7) << 8) | ((bytes >> 8) << 12);
 }
 
-struct CachedTexture { Image image; uint32_t descriptor = 0; uint64_t contentHash = 0; };
+struct CachedTexture { Image image, staging; uint32_t descriptor = 0, levels = 1; uint64_t contentHash = 0; };
+
+VkPhysicalDevice VulkanPhysicalDevice();
+
+// Fonctionnalités d'un format (blit filtré pour générer les mips)
+static bool CanBlit(VkFormat format, VkFormatFeatureFlags need)
+{
+    static std::unordered_map<uint32_t, VkFormatFeatureFlags> cache;
+    auto it = cache.find(format);
+    if (it == cache.end())
+    {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(VulkanPhysicalDevice(), format, &p);
+        it = cache.emplace(format, p.optimalTilingFeatures).first;
+    }
+    return (it->second & need) == need;
+}
 static std::unordered_map<uint64_t, CachedTexture> s_textures;
 static VkComponentSwizzle Swizzle(uint32_t sel)
 {
@@ -720,6 +737,17 @@ static VkComponentSwizzle Swizzle(uint32_t sel)
 static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
 {
     if ((f[0] & 3) != 2) return 0;
+    static bool texLog = getenv("IKARUGA_TEXLOG");
+    if (texLog)
+    {
+        // Combinaisons distinctes : format, signes (3 = gamma), exp_adjust, filtres mag/min/mip, niveaux de mip
+        static std::unordered_map<uint64_t, int> seen;
+        int exp = int32_t(f[3] << 13) >> 26;
+        uint64_t k = (f[1] & 0x3F) | uint64_t((f[0] >> 2) & 0xFF) << 8 | uint64_t(exp & 0x3F) << 16 | uint64_t((f[3] >> 19) & 0x3F) << 24 | uint64_t((f[4] >> 2) & 0xFF) << 32;
+        if (!seen[k]++) KLOG("texture : format %u signes %02X exp %d filtres mag %u min %u mip %u, mips %u-%u, %ux%u, pix_center %u",
+            f[1] & 0x3F, (f[0] >> 2) & 0xFF, exp, (f[3] >> 19) & 3, (f[3] >> 21) & 3, (f[3] >> 23) & 3, (f[4] >> 2) & 15, (f[4] >> 6) & 15,
+            (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, 0u);
+    }
     uint32_t format = f[1] & 0x3F, endian = (f[1] >> 6) & 3, base = (f[1] >> 12) << 12;
     uint32_t width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1, dim = (f[5] >> 9) & 3;
     if (dim == 0) { width = (f[2] & 0xFFFFFF) + 1; height = 1; dim = 1; }   // 1D : texture 2D d'une ligne
@@ -766,17 +794,35 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
                 std::swap(d[0], d[1]);
         }
 
+    // Mips : le jeu fournit les siennes (souvent 0 à 8-10), on les régénère sur le GPU à partir du niveau 0 par
+    // blits filtrés ; sans elles, les textures réduites (polices en particulier) crénellent.
+    // Les formats compressés passent par une image intermédiaire et sont décompressés en RGBA8.
+    uint32_t mipMax = (f[4] >> 6) & 15, levels = 1;
+    if (((f[3] >> 23) & 3) != 2 && mipMax)
+        levels = std::min(mipMax + 1, 32u - __builtin_clz(std::max(width, height)));
+    VkFormat finalFormat = info.vk;
+    const VkFormatFeatureFlags blitDst = VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    bool viaStaging = false;
+    if (levels > 1 && !CanBlit(info.vk, blitDst))
+    {
+        if (CanBlit(info.vk, VK_FORMAT_FEATURE_BLIT_SRC_BIT) && CanBlit(VK_FORMAT_R8G8B8A8_UNORM, blitDst)) { finalFormat = VK_FORMAT_R8G8B8A8_UNORM; viaStaging = true; }
+        else levels = 1;
+    }
+
     bool created = it == s_textures.end();
     CachedTexture& t = s_textures[key];
     if (created)
     {
+        t.levels = levels;
         VkImageCreateInfo ci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         ci.imageType = VK_IMAGE_TYPE_2D;
-        ci.format = info.vk;
+        ci.format = finalFormat;
         ci.extent = { width, height, 1 };
-        ci.mipLevels = ci.arrayLayers = 1;
+        ci.mipLevels = levels;
+        ci.arrayLayers = 1;
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
-        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (viaStaging) t.staging = CreateImage(width, height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, info.vk);
         vkCreateImage(s_dev, &ci, nullptr, &t.image.image);
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(s_dev, t.image.image, &req);
@@ -786,9 +832,9 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
         VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = t.image.image;
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = info.vk;
+        vi.format = finalFormat;
         vi.components = { Swizzle(sw), Swizzle(sw >> 3), Swizzle(sw >> 6), Swizzle(sw >> 9) };
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1 };
         vkCreateImageView(s_dev, &vi, nullptr, &t.image.view);
         t.descriptor = s_nextDescriptor++;
         VkDescriptorImageInfo ii{ VK_NULL_HANDLE, t.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -805,17 +851,64 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
     copy.bufferRowLength = bw * info.blockSize;
     copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     copy.imageExtent = { width, height, 1 };
-    vkCmdCopyBufferToImage(s_cmd, s_upload, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    Transition(t.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (t.staging.image)
+    {
+        Transition(t.staging, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdCopyBufferToImage(s_cmd, s_upload, t.staging.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        Transition(t.staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkImageBlit b{};
+        b.srcSubresource = b.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        b.srcOffsets[1] = b.dstOffsets[1] = { int32_t(width), int32_t(height), 1 };
+        vkCmdBlitImage(s_cmd, t.staging.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    }
+    else
+        vkCmdCopyBufferToImage(s_cmd, s_upload, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    for (uint32_t level = 1; level < t.levels; level++)
+    {
+        // niveau précédent : écriture terminée -> source du blit
+        VkImageMemoryBarrier mb{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; mb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        mb.srcQueueFamilyIndex = mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mb.image = t.image.image;
+        mb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 1, 0, 1 };
+        vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &mb);
+        VkImageBlit b{};
+        b.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1 };
+        b.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1 };
+        b.srcOffsets[1] = { int32_t(std::max(1u, width >> (level - 1))), int32_t(std::max(1u, height >> (level - 1))), 1 };
+        b.dstOffsets[1] = { int32_t(std::max(1u, width >> level)), int32_t(std::max(1u, height >> level)), 1 };
+        vkCmdBlitImage(s_cmd, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
+    if (t.levels > 1)
+    {
+        // niveaux 0..n-2 en source, le dernier en destination : tout passe en lecture
+        VkImageMemoryBarrier mb[2]{};
+        for (auto& m : mb)
+        {
+            m.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            m.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT; m.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            m.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            m.srcQueueFamilyIndex = m.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            m.image = t.image.image;
+        }
+        mb[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; mb[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, t.levels - 1, 0, 1 };
+        mb[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; mb[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, t.levels - 1, 1, 0, 1 };
+        vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, mb);
+        t.image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    else
+        Transition(t.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return t.descriptor;
 }
 
-// Sampler : filtre (mag) et adressage (X) de la fetch constant
+// Sampler : filtre (mag), adressage (X) et filtre de mip (1 = linéaire) de la fetch constant
 static uint32_t GetSampler(const uint32_t* f)
 {
     bool point = ((f[3] >> 19) & 3) == 0;
     bool wrap = ((f[0] >> 10) & 7) == 0;
-    return (point ? 1 : 0) | (wrap ? 2 : 0);
+    bool mipLinear = ((f[3] >> 23) & 3) == 1;
+    return (point ? 1 : 0) | (wrap ? 2 : 0) | (mipLinear ? 4 : 0);
 }
 
 // ------------------------------------------------------------------ dessin
