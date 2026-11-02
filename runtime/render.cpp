@@ -42,6 +42,7 @@ static VkDescriptorSetLayout s_setLayouts[4];
 static VkDescriptorPool s_descPool;
 static VkDescriptorSet s_sets[4];
 static VkSampler s_sampler;
+static VkSampler s_samplers[4];   // [linéaire|point] x [clamp|wrap], indices 0-3 du tableau de samplers
 static VkPipelineLayout s_pipelineLayout;
 static std::unordered_map<uint64_t, VkPipeline> s_pipelines;
 static std::unordered_map<const TranslatedShader*, VkShaderModule> s_modules;
@@ -121,7 +122,8 @@ static bool Init()
     // Tampon d'envoi : sommets + constantes, lu par les shaders via son adresse GPU
     VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     bi.size = kUploadSize;
-    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     vkCreateBuffer(s_dev, &bi, nullptr, &s_upload);
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(s_dev, s_upload, &req);
@@ -192,17 +194,22 @@ static bool Init()
     da.pSetLayouts = s_setLayouts;
     vkAllocateDescriptorSets(s_dev, &da, s_sets);
 
-    VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
-    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    si.maxLod = VK_LOD_CLAMP_NONE;
-    vkCreateSampler(s_dev, &si, nullptr, &s_sampler);
+    VkDescriptorImageInfo samplerInfos[4];
+    for (int i = 0; i < 4; i++)
+    {
+        VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        si.magFilter = si.minFilter = (i & 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = VK_LOD_CLAMP_NONE;
+        vkCreateSampler(s_dev, &si, nullptr, &s_samplers[i]);
+        samplerInfos[i] = { s_samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    }
+    s_sampler = s_samplers[0];
 
     VkDescriptorImageInfo whiteInfo{ VK_NULL_HANDLE, s_white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-    VkDescriptorImageInfo samplerInfo{ s_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
     VkWriteDescriptorSet writes[2]{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &whiteInfo };
-    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[3], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &samplerInfo };
+    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[3], 0, 0, 4, VK_DESCRIPTOR_TYPE_SAMPLER, samplerInfos };
     vkUpdateDescriptorSets(s_dev, 2, writes, 0, nullptr);
 
     VkPushConstantRange push{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24 };
@@ -437,6 +444,154 @@ static void Resolve(const uint32_t* regs)
     }
 }
 
+// ------------------------------------------------------------------ textures
+
+struct TextureFormatInfo { VkFormat vk; uint32_t blockSize, bytesPerBlock; };
+
+static TextureFormatInfo TextureFormat(uint32_t fmt)
+{
+    switch (fmt)
+    {
+    case 2:  return { VK_FORMAT_R8_UNORM, 1, 1 };                    // k_8
+    case 4:  return { VK_FORMAT_R5G6B5_UNORM_PACK16, 1, 2 };         // k_5_6_5
+    case 6:  return { VK_FORMAT_B8G8R8A8_UNORM, 1, 4 };              // k_8_8_8_8 (ARGB big-endian)
+    case 15: return { VK_FORMAT_B4G4R4A4_UNORM_PACK16, 1, 2 };       // k_4_4_4_4
+    case 18: return { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 8 };        // k_DXT1
+    case 19: return { VK_FORMAT_BC2_UNORM_BLOCK, 4, 16 };            // k_DXT2_3
+    case 20: return { VK_FORMAT_BC3_UNORM_BLOCK, 4, 16 };            // k_DXT4_5
+    default: return { VK_FORMAT_UNDEFINED, 1, 4 };
+    }
+}
+
+static uint32_t SwapEndian(uint32_t v, uint32_t endian)
+{
+    switch (endian)
+    {
+    case 1: return ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF);
+    case 2: return __builtin_bswap32(v);
+    case 3: return (v << 16) | (v >> 16);
+    default: return v;
+    }
+}
+
+// Adresse d'un bloc dans une texture 2D tuilée (Tiled2D de Xenia, texture_address.h)
+static uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitchAligned, uint32_t bppLog2)
+{
+    uint32_t outer = ((y >> 5) * (pitchAligned >> 5) + (x >> 5)) << 6;
+    uint32_t inner = (((y >> 1) & 7) << 3) | (x & 7);
+    uint32_t bytes = (outer | inner) << bppLog2;
+    uint32_t bank = (y >> 4) & 1, pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
+    return ((y & 1) << 4) | (pipe << 6) | (bank << 11) | (bytes & 15) | (((bytes >> 4) & 1) << 5) | (((bytes >> 5) & 7) << 8) | ((bytes >> 8) << 12);
+}
+
+struct CachedTexture { Image image; uint32_t descriptor = 0; uint64_t contentHash = 0; };
+static std::unordered_map<uint64_t, CachedTexture> s_textures;
+static uint32_t s_nextDescriptor = 1;   // 0 = texture de remplacement
+
+static VkComponentSwizzle Swizzle(uint32_t sel)
+{
+    static const VkComponentSwizzle map[] = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A,
+        VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO };
+    return map[sel & 7];
+}
+
+// Texture décrite par une fetch constant (6 dwords) -> indice dans le tableau de descripteurs (0 si non gérée)
+static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
+{
+    if ((f[0] & 3) != 2) return 0;
+    uint32_t format = f[1] & 0x3F, endian = (f[1] >> 6) & 3, base = (f[1] >> 12) << 12;
+    uint32_t width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1, dim = (f[5] >> 9) & 3;
+    uint32_t pitch = ((f[0] >> 22) & 0x1FF) << 5;
+    bool tiled = f[0] >> 31;
+    TextureFormatInfo info = TextureFormat(format);
+    if (dim != 1 || info.vk == VK_FORMAT_UNDEFINED || !base)
+    {
+        static std::unordered_map<uint32_t, int> warned;
+        if (!warned[format * 4 + dim]++) KLOG("rendu : texture format %u dimension %u non gérée", format, dim);
+        return 0;
+    }
+
+    uint32_t bw = (width + info.blockSize - 1) / info.blockSize, bh = (height + info.blockSize - 1) / info.blockSize;
+    uint32_t pitchBlocks = std::max((pitch ? pitch : width) / info.blockSize, bw);
+    uint32_t pitchAligned = (pitchBlocks + 31) & ~31u, heightAligned = (bh + 31) & ~31u;
+    uint32_t bppLog2 = __builtin_ctz(info.bytesPerBlock);
+    uint32_t srcSize = tiled ? pitchAligned * heightAligned * info.bytesPerBlock : pitchBlocks * bh * info.bytesPerBlock;
+    const uint8_t* src = g_base + phys(base);
+
+    uint64_t key = XXH3_64bits(f, 24);
+    uint64_t content = XXH3_64bits(src, srcSize);
+    auto it = s_textures.find(key);
+    if (it != s_textures.end() && it->second.contentHash == content) return it->second.descriptor;
+
+    // Dé-tuilage + remise en ordre des octets dans le tampon d'envoi
+    EndRenderPass();
+    uint32_t rowBytes = bw * info.bytesPerBlock;
+    VkDeviceSize at = Upload(nullptr, VkDeviceSize(rowBytes) * bh, 16);
+    uint8_t* dst = s_uploadPtr + at;
+    for (uint32_t y = 0; y < bh; y++)
+        for (uint32_t x = 0; x < bw; x++)
+        {
+            uint32_t off = tiled ? Tiled2D(x, y, pitchAligned, bppLog2) : (y * pitchBlocks + x) * info.bytesPerBlock;
+            uint8_t* d = dst + y * rowBytes + x * info.bytesPerBlock;
+            if (off + info.bytesPerBlock > srcSize) { memset(d, 0, info.bytesPerBlock); continue; }
+            memcpy(d, src + off, info.bytesPerBlock);
+            if (info.bytesPerBlock >= 4)
+                for (uint32_t i = 0; i < info.bytesPerBlock; i += 4) { uint32_t v; memcpy(&v, d + i, 4); v = SwapEndian(v, endian); memcpy(d + i, &v, 4); }
+            else if (info.bytesPerBlock == 2 && (endian == 1 || endian == 2))
+                std::swap(d[0], d[1]);
+        }
+
+    bool created = it == s_textures.end();
+    CachedTexture& t = s_textures[key];
+    if (created)
+    {
+        VkImageCreateInfo ci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = info.vk;
+        ci.extent = { width, height, 1 };
+        ci.mipLevels = ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        vkCreateImage(s_dev, &ci, nullptr, &t.image.image);
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(s_dev, t.image.image, &req);
+        t.image.memory = Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkBindImageMemory(s_dev, t.image.image, t.image.memory, 0);
+        uint32_t sw = (f[3] >> 1) & 0xFFF;
+        VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = t.image.image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = info.vk;
+        vi.components = { Swizzle(sw), Swizzle(sw >> 3), Swizzle(sw >> 6), Swizzle(sw >> 9) };
+        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCreateImageView(s_dev, &vi, nullptr, &t.image.view);
+        t.descriptor = s_nextDescriptor++;
+        VkDescriptorImageInfo ii{ VK_NULL_HANDLE, t.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, t.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
+        vkUpdateDescriptorSets(s_dev, 1, &w, 0, nullptr);
+        if (getenv("IKARUGA_DRAWLOG"))
+            KLOG("texture %ux%u format %u %s swizzle %03X -> descripteur %u", width, height, format, tiled ? "tuilée" : "linéaire", sw, t.descriptor);
+    }
+    t.contentHash = content;
+    Transition(t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = at;
+    copy.bufferRowLength = bw * info.blockSize;
+    copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    copy.imageExtent = { width, height, 1 };
+    vkCmdCopyBufferToImage(s_cmd, s_upload, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    Transition(t.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return t.descriptor;
+}
+
+// Sampler : filtre (mag) et adressage (X) de la fetch constant
+static uint32_t GetSampler(const uint32_t* f)
+{
+    bool point = ((f[3] >> 19) & 3) == 0;
+    bool wrap = ((f[0] >> 10) & 7) == 0;
+    return (point ? 1 : 0) | (wrap ? 2 : 0);
+}
+
 // ------------------------------------------------------------------ dessin
 
 void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint32_t))
@@ -525,7 +680,16 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     // Constantes : VS = registres ALU 0-255, PS = 256-479 (float4, valeurs déjà en ordre hôte)
     VkDeviceSize vsConst = Upload(regs + ALU_CONSTANTS, 4096, 256);
     VkDeviceSize psConst = Upload(regs + ALU_CONSTANTS + 256 * 4, 3584, 256);
-    uint8_t shared[512]{};   // indices de descripteurs (0 = texture blanche), booléens, seuil alpha
+    uint8_t shared[512]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha
+    // Textures du pixel shader : l'échantillonneur n lit la fetch constant n ; indices 2D en c0-c3, samplers en c12-c15
+    for (uint32_t slot = 0; slot < 16; slot++)
+    {
+        const uint32_t* f = regs + FETCH_CONSTANTS + slot * 6;
+        if ((f[0] & 3) != 2) continue;
+        uint32_t tex = GetTexture(f, phys), smp = GetSampler(f);
+        memcpy(shared + slot * 4, &tex, 4);
+        memcpy(shared + 192 + slot * 4, &smp, 4);
+    }
     uint32_t booleans = (regs[BOOL_CONSTANTS] & 0xFFFF) | ((regs[BOOL_CONSTANTS + 4] & 0xFFFF) << 16);
     memcpy(shared + 256, &booleans, 4);
     memcpy(shared + 272, &regs[RB_ALPHA_REF], 4);
