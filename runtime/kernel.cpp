@@ -105,26 +105,67 @@ static std::shared_ptr<KObject> FromHandle(uint32_t h)
 }
 
 // Objet hôte associé à une structure DISPATCHER_HEADER invitée (créé à la première utilisation)
+// Objet "dispatcher" invité (KEVENT, KSEMAPHORE...) : l'état vit dans la structure DISPATCHER_HEADER du jeu
+// (type à +0, état de signal à +4, limite de sémaphore à +0x10), car les jeux l'initialisent et le
+// modifient aussi directement en mémoire. Les attentes interrogent cet état (réveil par condition + 2 ms).
+static std::mutex s_dispatchMutex;
+static std::condition_variable s_dispatchCv;
+
+struct KGuestDispatcher : KObject
+{
+    uint32_t addr;
+    explicit KGuestDispatcher(uint32_t a) : addr(a) {}
+
+    bool TryAcquire()
+    {
+        uint8_t type = Rd8(addr);
+        int32_t state = int32_t(Rd32(addr + 4));
+        if (state <= 0) return false;
+        if (type == 1) Wr32(addr + 4, 0);                   // événement de synchronisation : auto-reset
+        else if (type == 5) Wr32(addr + 4, state - 1);      // sémaphore
+        return true;
+    }
+    bool Wait(int64_t timeoutMs) override
+    {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs < 0 ? 0 : timeoutMs);
+        std::unique_lock lock(s_dispatchMutex);
+        for (;;)
+        {
+            if (TryAcquire()) return true;
+            if (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline) return false;
+            s_dispatchCv.wait_for(lock, std::chrono::milliseconds(2));
+        }
+    }
+    void Signal() override
+    {
+        { std::lock_guard lock(s_dispatchMutex); Wr32(addr + 4, 1); }
+        s_dispatchCv.notify_all();
+    }
+    void Reset() { std::lock_guard lock(s_dispatchMutex); Wr32(addr + 4, 0); }
+    int32_t Release(int32_t n)
+    {
+        int32_t prev;
+        {
+            std::lock_guard lock(s_dispatchMutex);
+            prev = int32_t(Rd32(addr + 4));
+            int32_t limit = int32_t(Rd32(addr + 0x10));
+            Wr32(addr + 4, uint32_t(limit > 0 ? std::min(prev + n, limit) : prev + n));
+        }
+        s_dispatchCv.notify_all();
+        return prev;
+    }
+};
+
+static std::unordered_map<uint32_t, std::shared_ptr<KObject>> s_threadDispatchers;   // KTHREAD invité -> thread hôte
+
 static std::shared_ptr<KObject> FromDispatcher(uint32_t addr)
 {
     std::lock_guard l(s_objMutex);
+    if (auto it = s_threadDispatchers.find(addr); it != s_threadDispatchers.end()) return it->second;
     if (auto it = s_dispatchers.find(addr); it != s_dispatchers.end()) return it->second;
-    std::shared_ptr<KObject> obj;
     uint8_t type = Rd8(addr);
-    int32_t state = (int32_t)Rd32(addr + 4);
-    if (type == 0 || type == 1)
-    {
-        auto ev = std::make_shared<KEvent>(); ev->manualReset = type == 0; ev->signaled = state != 0; obj = ev;
-    }
-    else if (type == 5)
-    {
-        auto sem = std::make_shared<KSemaphore>(); sem->count = state; sem->max = (int32_t)Rd32(addr + 0x10); obj = sem;
-    }
-    else
-    {
-        KLOG("objet dispatcher de type %u inconnu à %08X", type, addr);
-        obj = std::make_shared<KEvent>();
-    }
+    if (type != 0 && type != 1 && type != 5) KLOG("objet dispatcher de type %u à %08X traité comme un événement", type, addr);
+    auto obj = std::make_shared<KGuestDispatcher>(addr);
     s_dispatchers[addr] = obj;
     return obj;
 }
@@ -253,20 +294,25 @@ KFUNC(NtCreateEvent)   // (pHandle, objAttr, eventType, initialState)
     Wr32(ARG(3), NewHandle(ev));
     RET(STATUS_SUCCESS);
 }
-KFUNC(NtSetEvent) { if (auto o = FromHandle(ARG(3))) o->Signal(); RET(STATUS_SUCCESS); }
+static void SyncLog(const char* what, uint32_t id, uint32_t lr) { static int n; if (getenv("IKARUGA_SYNCLOG") && n++ < 200) KLOG("%s %08X (depuis %08X)", what, id, lr); }
+KFUNC(NtSetEvent) { SyncLog("NtSetEvent", ARG(3), uint32_t(ctx.lr)); if (auto o = FromHandle(ARG(3))) o->Signal(); RET(STATUS_SUCCESS); }
 KFUNC(NtClearEvent) { if (auto e = std::dynamic_pointer_cast<KEvent>(FromHandle(ARG(3)))) e->Reset(); RET(STATUS_SUCCESS); }
-KFUNC(KeSetEvent) { FromDispatcher(ARG(3))->Signal(); RET(0); }
-KFUNC(KeResetEvent) { if (auto e = std::dynamic_pointer_cast<KEvent>(FromDispatcher(ARG(3)))) e->Reset(); RET(0); }
+KFUNC(KeSetEvent) { SyncLog("KeSetEvent", ARG(3), uint32_t(ctx.lr)); FromDispatcher(ARG(3))->Signal(); RET(0); }
+KFUNC(KeResetEvent)
+{
+    auto o = FromDispatcher(ARG(3));
+    if (auto g = std::dynamic_pointer_cast<KGuestDispatcher>(o)) g->Reset();
+    else if (auto e = std::dynamic_pointer_cast<KEvent>(o)) e->Reset();
+    RET(0);
+}
 
 KFUNC(KeInitializeSemaphore)   // (sem, count, limit)
 {
     Wr8(ARG(3), 5); Wr32(ARG(3) + 4, ARG(4)); Wr32(ARG(3) + 0x10, ARG(5));
-    std::lock_guard l(s_objMutex);
-    s_dispatchers.erase(ARG(3));
 }
 KFUNC(KeReleaseSemaphore)   // (sem, increment, adjustment, wait)
 {
-    auto sem = std::dynamic_pointer_cast<KSemaphore>(FromDispatcher(ARG(3)));
+    auto sem = std::dynamic_pointer_cast<KGuestDispatcher>(FromDispatcher(ARG(3)));
     RET(sem ? sem->Release(ARG(5)) : 0);
 }
 
@@ -357,6 +403,8 @@ KFUNC(ObReferenceObject) {}
 static std::mutex s_threadsMutex;
 static std::unordered_map<uint32_t, std::shared_ptr<KThread>> s_threadsByGuest;   // KTHREAD invité -> thread
 
+void DebugRegisterThread(const char* name);
+
 static void ThreadMain(std::shared_ptr<KThread> t)
 {
     {
@@ -364,6 +412,10 @@ static void ThreadMain(std::shared_ptr<KThread> t)
         t->suspendCv.wait(l, [&] { return !t->suspended; });
     }
     PPCContext& ctx = t->ctx;
+    {
+        char name[32]; snprintf(name, sizeof name, "thread %08X", t->startCtx ? t->startCtx : t->startAddr);
+        DebugRegisterThread(name);
+    }
     KLOG("thread %08X démarré (KTHREAD %08X)", t->startAddr, t->guestThread);
     if (t->xapiStartup)
     {
@@ -386,6 +438,7 @@ KFUNC(ExCreateThread)   // (pHandle, stackSize, pThreadId, xapiStartup, startAdd
     KLOG("ExCreateThread start=%08X ctx=%08X xapi=%08X flags=%X", t->startAddr, t->startCtx, t->xapiStartup, ARG(9));
     GuestInitThreadContext(t->ctx, t->stackSize);
     t->guestThread = Rd32(t->ctx.r13.u32 + 0x100);
+    { std::lock_guard l(s_objMutex); s_threadDispatchers[t->guestThread] = t; }
     uint32_t h = NewHandle(t);
     if (ARG(3)) Wr32(ARG(3), h);
     if (ARG(5)) Wr32(ARG(5), Rd32(t->guestThread + 0x14C));   // identifiant du thread
@@ -764,6 +817,7 @@ void GpuInitializeRingBuffer(uint32_t base, uint32_t sizeLog2);
 void GpuEnableReadPointerWriteBack(uint32_t addr);
 void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx);
 void GpuOnSwap();
+extern std::recursive_mutex g_interruptMutex;
 void VulkanPresent(float r, float g, float b);
 void GpuPrintStats();
 KFUNC(VdInitializeRingBuffer) { GpuInitializeRingBuffer(ARG(3), ARG(4)); }
@@ -787,6 +841,7 @@ KFUNC(VdSetGraphicsInterruptCallback)
                 std::this_thread::sleep_until(next);
                 if (uint32_t cb = s_gfxCallback)
                 {
+                    std::lock_guard lock(g_interruptMutex);   // sérialisé avec les interruptions du GPU
                     Wr8(ctx.r13.u32 + 0x10C, 2);   // Xenia livre le vblank sur le processeur 2
                     ctx.r3.u64 = 0;   // source : vblank
                     ctx.r4.u64 = s_gfxCallbackCtx;

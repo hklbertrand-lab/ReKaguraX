@@ -135,7 +135,18 @@ static bool LoadExecutable()
 
 #ifdef _WIN32
 static std::atomic<HANDLE> s_gameThread;
+static std::mutex s_debugThreadsMutex;
+static std::vector<std::pair<std::string, HANDLE>> s_debugThreads;
 #endif
+
+// Débogage : rend un thread visible pour IKARUGA_SAMPLE
+void DebugRegisterThread(const char* name)
+{
+#ifdef _WIN32
+    std::lock_guard l(s_debugThreadsMutex);
+    s_debugThreads.push_back({ name, OpenThread(THREAD_ALL_ACCESS, FALSE, GetCurrentThreadId()) });
+#endif
+}
 
 static void GuestMain()
 {
@@ -217,12 +228,16 @@ int main(int argc, char** argv)
             for (;;)
             {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
-                HANDLE h = s_gameThread;
-                SuspendThread(h);
-                CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
-                GetThreadContext(h, &c);
-                fprintf(stderr, "[sample] rip exe+%llX\n",(unsigned long long)(c.Rip - (uint64_t)GetModuleHandleW(nullptr)));
-                ResumeThread(h);
+                std::vector<std::pair<std::string, HANDLE>> threads{ { "principal", s_gameThread.load() } };
+                { std::lock_guard l(s_debugThreadsMutex); threads.insert(threads.end(), s_debugThreads.begin(), s_debugThreads.end()); }
+                for (auto& [name, h] : threads)
+                {
+                    SuspendThread(h);
+                    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+                    GetThreadContext(h, &c);
+                    fprintf(stderr, "[sample] %s rip exe+%llX\n", name.c_str(), (unsigned long long)(c.Rip - (uint64_t)GetModuleHandleW(nullptr)));
+                    ResumeThread(h);
+                }
             }
         }).detach();
     }

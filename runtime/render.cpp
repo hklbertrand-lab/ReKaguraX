@@ -598,7 +598,9 @@ static uint32_t GetSampler(const uint32_t* f)
 void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint32_t))
 {
     static int logged;
-    if (getenv("IKARUGA_DRAWLOG") && logged++ < 400)
+    static uint64_t drawFrom = getenv("IKARUGA_DRAWLOG") ? strtoull(getenv("IKARUGA_DRAWLOG"), nullptr, 10) : 0;
+    extern uint64_t g_presentCount;
+    if (drawFrom && g_presentCount >= drawFrom && logged++ < 400)
         KLOG("RenderDraw init=%08X mode=%u vs=%016llx ps=%016llx copy=%08X clear=%08X", initiator, regs[RB_MODECONTROL] & 7,
             s_vs ? (unsigned long long)s_vs->containerHash : 0ull, s_ps ? (unsigned long long)s_ps->containerHash : 0ull,
             regs[RB_COPY_CONTROL], regs[RB_COLOR_CLEAR]);
@@ -755,6 +757,8 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
 }
 
 // Paquet de présentation inséré par VdSwap : affiche le tampon d'affichage
+uint64_t g_presentCount;
+
 void RenderPresent()
 {
     static int logged;
@@ -764,4 +768,5 @@ void RenderPresent()
     Transition(s_front, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VulkanPresentFrame(s_front.image, kWidth, kHeight);
     s_frameStarted = false;
+    g_presentCount++;
 }

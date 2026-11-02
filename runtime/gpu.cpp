@@ -39,12 +39,23 @@ static uint32_t GpuSwap(uint32_t v, uint32_t endian)
 
 // Le GPU lit la mémoire brute (octets big-endian vus en little-endian) puis applique le swap demandé
 // dans les 2 bits bas de l'adresse ; Rd32/Wr32 font déjà un swap, d'où le bswap supplémentaire.
-static void MemWrite(uint32_t addr, uint32_t value) { Wr32(Phys(addr & ~3u), __builtin_bswap32(GpuSwap(value, addr & 3))); }
+static uint32_t s_curOpcode;
+static void MemWrite(uint32_t addr, uint32_t value)
+{
+    Wr32(Phys(addr & ~3u), __builtin_bswap32(GpuSwap(value, addr & 3)));
+    static int n;
+    static bool ibLog = getenv("IKARUGA_IBLOG");
+    if ((addr & 0x1FFFFFFC) == 0x20A000 && (ibLog || (getenv("IKARUGA_FENCELOG") && (n++ % 50) == 0)))
+        KLOG("fence écrite par opcode %02X : %08X", s_curOpcode, Rd32(Phys(addr & ~3u)));
+}
 static uint32_t MemRead(uint32_t addr) { return GpuSwap(__builtin_bswap32(Rd32(Phys(addr & ~3u))), addr & 3); }
+
+std::recursive_mutex g_interruptMutex;
 
 void GpuDispatchInterrupt(uint32_t source, uint32_t cpu)
 {
     if (!s_interruptCallback) return;
+    std::lock_guard lock(g_interruptMutex);   // le matériel sérialise les interruptions graphiques
     Wr8(s_ctx.r13.u32 + 0x10C, (uint8_t)cpu);   // processeur courant vu par le gestionnaire
     s_ctx.r3.u64 = source;
     s_ctx.r4.u64 = s_interruptCallbackCtx;
@@ -55,9 +66,14 @@ static void WriteRegister(uint32_t index, uint32_t value)
 {
     if (index >= 0x8000) return;
     s_regs[index] = value;
+    // Le CPU lit les registres GPU via la fenêtre MMIO (ex. D3D lit dans SCRATCH 0x57C la fonction à
+    // appeler lors d'une interruption) : on y reflète chaque écriture du flux de commandes
+    if (index != REG_CP_RB_WPTR) Wr32(MMIO_BASE + index * 4, value);
     if (index >= REG_SCRATCH_REG0 && index < REG_SCRATCH_REG0 + 8)
     {
         uint32_t n = index - REG_SCRATCH_REG0;
+        static int logged;
+        if (getenv("IKARUGA_IBLOG") && logged++ < 20) KLOG("SCRATCH%u = %08X (UMSK=%08X ADDR=%08X)", n, value, s_regs[REG_SCRATCH_UMSK], s_regs[REG_SCRATCH_ADDR]);
         if ((1u << n) & s_regs[REG_SCRATCH_UMSK])
             Wr32(Phys(s_regs[REG_SCRATCH_ADDR] + n * 4), value);
     }
@@ -160,6 +176,7 @@ static void ExecutePacket(Reader& r)
 
     uint32_t opcode = (packet >> 8) & 0x7F, count = ((packet >> 16) & 0x3FFF) + 1;
     s_stats.opcodes[opcode]++;
+    s_curOpcode = opcode;
     uint32_t end = r.pos;
     r.Skip(count); uint32_t next = r.pos; r.pos = end;   // position du paquet suivant
 
@@ -168,6 +185,14 @@ static void ExecutePacket(Reader& r)
     case 0x3F: case 0x37:   // INDIRECT_BUFFER(_PFD)
     {
         uint32_t ptr = r.Read(), len = r.Read() & 0xFFFFF;
+        static bool ibLog = getenv("IKARUGA_IBLOG");
+        if (ibLog) KLOG("IB %08X %u mots (ring pos %u)", ptr, len, r.ring ? r.pos : 0xFFFFFFFF);
+        if (ibLog && len < 40)
+        {
+            std::string hex;
+            for (uint32_t i = 0; i < len; i++) { char b[12]; snprintf(b, sizeof b, "%08X ", Rd32(Phys(ptr + i * 4))); hex += b; }
+            KLOG("   %s", hex.c_str());
+        }
         ExecuteIndirect(ptr, len);
         break;
     }
@@ -221,6 +246,12 @@ static void ExecutePacket(Reader& r)
     {
         uint32_t initiator = r.Read(), addr = r.Read(), value = r.Read();
         MemWrite(addr, (initiator >> 31) ? s_swapCounter : value);
+        static auto last = std::chrono::steady_clock::now();
+        if (getenv("IKARUGA_FENCELOG") && std::chrono::steady_clock::now() - last > std::chrono::milliseconds(500))
+        {
+            last = std::chrono::steady_clock::now();
+            KLOG("EVENT_WRITE_SHD initiateur=%08X adresse=%08X valeur=%08X compteur=%u", initiator, addr, value, s_swapCounter);
+        }
         break;
     }
     case 0x5A:   // EVENT_WRITE_EXT : étendue d'écran (valeurs maximales, comme Xenia)
@@ -314,8 +345,11 @@ static void ExecuteIndirect(uint32_t addr, uint32_t sizeDwords)
     while (r.pos < sizeDwords) ExecutePacket(r);
 }
 
+void DebugRegisterThread(const char* name);
+
 static void GpuThread()
 {
+    DebugRegisterThread("gpu");
     GuestInitThreadContext(s_ctx, 0x10000);
     for (;;)
     {

@@ -2,6 +2,7 @@
 #include "guest.h"
 #include <initializer_list>
 #include <vector>
+#include <chrono>
 #ifdef _WIN32
 #include <windows.h>
 static void DumpHostStack()
@@ -46,32 +47,7 @@ PPC_FUNC(sub_82167938)
     __imp__sub_82167938(ctx, base);
 }
 
-// Vérifie le memcpy recompilé du jeu contre une copie hôte
-extern "C" PPC_FUNC(__imp__sub_821E0340);
-PPC_FUNC(sub_821E0340)
-{
-    uint32_t dst = ctx.r3.u32, src = ctx.r4.u32, n = ctx.r5.u32;
-    std::vector<uint8_t> expect(g_base + src, g_base + src + n);
-    __imp__sub_821E0340(ctx, base);
-    if (memcmp(expect.data(), g_base + dst, n) != 0)
-    {
-        static int count;
-        if (count++ < 10)
-        {
-            uint32_t i = 0; while (expect[i] == g_base[dst + i]) i++;
-            KLOG("memcpy FAUX dst=%08X src=%08X n=%u : premier écart à +%u", dst, src, n, i);
-        }
-    }
-}
 
-extern "C" PPC_FUNC(__imp__sub_821E0870);
-PPC_FUNC(sub_821E0870)
-{
-    uint32_t dst = ctx.r3.u32, v = ctx.r4.u32 & 0xFF, n = ctx.r5.u32;
-    __imp__sub_821E0870(ctx, base);
-    for (uint32_t i = 0; i < n; i++)
-        if (g_base[dst + i] != v) { static int c; if (c++ < 10) KLOG("memset FAUX dst=%08X v=%02X n=%u écart +%u", dst, v, n, i); break; }
-}
 
 extern "C" PPC_FUNC(__imp__sub_8216F760);
 PPC_FUNC(sub_8216F760)
@@ -87,37 +63,56 @@ PPC_FUNC(sub_8216F760)
     __imp__sub_8216F760(ctx, base);
 }
 
+extern uint32_t g_fenceTarget;
 extern "C" PPC_FUNC(__imp__sub_821600C8);
 PPC_FUNC(sub_821600C8)
 {
     static int c;
     uint32_t dev = Rd32(ctx.r3.u32);
-    if (c++ % 200000 == 0)
-        KLOG("attente GPU : dev=%08X [10896]=%08X -> %08X, wptr reg=%08X, wb[0x20A03C]=%08X, 10888=%08X",
-            dev, Rd32(dev + 10896), Rd32(Rd32(dev + 10896)), Rd32(0x7FC80714), Rd32(0xA020A03C), Rd32(dev + 10888));
+    static auto last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(3))
+    {
+        last = std::chrono::steady_clock::now();
+        KLOG("attente GPU (retour %08X) : dev=%08X fence=%08X dernière=%08X wptr=%08X rptr=%08X +13232=%08X écriture D3D=%08X +52=%08X +56=%08X cible=%08X", uint32_t(ctx.lr),
+            dev, Rd32(Rd32(dev + 10896)), Rd32(dev + 10908), Rd32(0x7FC80714), Rd32(0xA020A03C), Rd32(dev + 13232), Rd32(dev + 48), Rd32(dev + 52), Rd32(dev + 56), g_fenceTarget);
+    }
     __imp__sub_821600C8(ctx, base);
 }
 
-// libjpeg (jpeg_consume_input ?) : état et gestionnaire d'erreur
-extern "C" PPC_FUNC(__imp__sub_822ACBD8);
-PPC_FUNC(sub_822ACBD8)
+
+
+// Écran ESRB : état de l'objet dessiné par sub_82102080
+extern "C" PPC_FUNC(__imp__sub_82102080);
+PPC_FUNC(sub_82102080)
 {
-    uint32_t cinfo = ctx.r3.u32, err = Rd32(cinfo);
-    static int c;
-    if (c++ < 5)
-        KLOG("jpeg cinfo=%08X state=%u err=%08X error_exit=%08X emit=%08X src=%08X", cinfo, Rd32(cinfo + 420), err,
-            err ? Rd32(err) : 0, err ? Rd32(err + 4) : 0, Rd32(cinfo + 24));
-    if (c == 1) DumpHostStack();
-    __imp__sub_822ACBD8(ctx, base);
-    if (err && c < 6) KLOG("  -> msg_code=%u", Rd32(err + 20));
+    static int n;
+    uint32_t o = ctx.r3.u32;
+    if (getenv("IKARUGA_ESRBLOG") && n++ % 60 == 0)
+    {
+        float f64; uint32_t v = Rd32(o + 64); memcpy(&f64, &v, 4);
+        KLOG("ESRB obj=%08X étape48=%u o49=%u état=%u,%u,%u,%u +64=%.3f +68=%08X +40=%08X +44=%08X", o, Rd8(o + 48), Rd8(o + 49), Rd8(o + 50), Rd8(o + 51), Rd8(o + 52), Rd8(o + 53),
+            f64, Rd32(o + 68), Rd32(o + 40), Rd32(o + 44));
+    }
+    if (getenv("IKARUGA_ESRBLOG") && n % 60 == 1)
+    {
+        uint32_t g = Rd32(0x827C0CD4), sys = Rd32(g + 2596);
+        KLOG("  sous-système [g+2596]=%08X vtable=%08X occupé(+112)=%u +100..+120: %08X %08X %08X %08X %08X %08X", sys, Rd32(sys), Rd8(sys + 112),
+            Rd32(sys + 100), Rd32(sys + 104), Rd32(sys + 108), Rd32(sys + 112), Rd32(sys + 116), Rd32(sys + 120));
+    }
+    __imp__sub_82102080(ctx, base);
 }
 
-// error_exit de libjpeg : affiche le code d'erreur (msg_code à err+20)
-extern "C" PPC_FUNC(__imp__sub_82247648);
-PPC_FUNC(sub_82247648)
+// Attente de fence GPU de D3D : cible, dernière fence émise, valeur écrite par le GPU
+extern "C" PPC_FUNC(__imp__sub_82161A20);
+uint32_t g_fenceTarget;
+PPC_FUNC(sub_82161A20)
 {
-    uint32_t cinfo = ctx.r3.u32, err = Rd32(cinfo);
-    KLOG("libjpeg error_exit : msg_code=%u parm=%u,%u", Rd32(err + 20), Rd32(err + 24), Rd32(err + 28));
-    DumpHostStack();
-    __imp__sub_82247648(ctx, base);
+    g_fenceTarget = ctx.r4.u32;
+    static int n;
+    uint32_t dev = ctx.r3.u32;
+    static auto last = std::chrono::steady_clock::now();
+    if (getenv("IKARUGA_FENCELOG") && std::chrono::steady_clock::now() - last > std::chrono::seconds(2) && (last = std::chrono::steady_clock::now(), true))
+        KLOG("attente fence : cible=%08X dernière=%08X gpu=%08X +13232=%08X r5=%08X", ctx.r4.u32, Rd32(dev + 10908),
+            Rd32(Rd32(dev + 10896)), Rd32(dev + 13232), ctx.r5.u32);
+    __imp__sub_82161A20(ctx, base);
 }
