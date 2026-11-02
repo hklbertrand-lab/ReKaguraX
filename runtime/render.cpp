@@ -65,7 +65,8 @@ static VkDescriptorSetLayout s_setLayouts[4];
 static VkDescriptorPool s_descPool;
 static VkDescriptorSet s_sets[4];
 static VkSampler s_sampler;
-static VkSampler s_samplers[8];   // [linéaire|point] x [clamp|wrap] x [mip au plus proche|mip linéaire], indices 0-7
+// Samplers : bit 0 point, bits 1-2 adressage U, bits 3-4 adressage V, bit 5 mip linéaire (64 combinaisons)
+static VkSampler s_samplers[64];
 static VkPipelineLayout s_pipelineLayout;
 static std::unordered_map<uint64_t, VkPipeline> s_pipelines;
 static std::unordered_map<const TranslatedShader*, VkShaderModule> s_modules;
@@ -189,13 +190,17 @@ static bool Init()
     da.pSetLayouts = s_setLayouts;
     vkAllocateDescriptorSets(s_dev, &da, s_sets);
 
-    VkDescriptorImageInfo samplerInfos[8];
-    for (int i = 0; i < 8; i++)
+    VkDescriptorImageInfo samplerInfos[64];
+    const VkSamplerAddressMode modes[4] = { VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER };
+    for (int i = 0; i < 64; i++)
     {
         VkSamplerCreateInfo si{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         si.magFilter = si.minFilter = (i & 1) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        si.mipmapMode = (i & 4) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        si.addressModeU = si.addressModeV = si.addressModeW = (i & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.mipmapMode = (i & 32) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        si.addressModeU = modes[(i >> 1) & 3];
+        si.addressModeV = si.addressModeW = modes[(i >> 3) & 3];
+        si.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
         si.maxLod = VK_LOD_CLAMP_NONE;
         vkCreateSampler(s_dev, &si, nullptr, &s_samplers[i]);
         samplerInfos[i] = { s_samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -205,7 +210,7 @@ static bool Init()
     VkDescriptorImageInfo whiteInfo{ VK_NULL_HANDLE, s_white.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkWriteDescriptorSet writes[2]{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &whiteInfo };
-    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[3], 0, 0, 8, VK_DESCRIPTOR_TYPE_SAMPLER, samplerInfos };
+    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[3], 0, 0, 64, VK_DESCRIPTOR_TYPE_SAMPLER, samplerInfos };
     vkUpdateDescriptorSets(s_dev, 2, writes, 0, nullptr);
 
     VkPushConstantRange push{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24 };
@@ -461,21 +466,57 @@ struct VertexLayout
     uint32_t bindingCount = 0, attributeCount = 0;
     uint32_t fetchConst[16];      // constante de fetch de chaque binding
     bool allFloat32 = true;       // nécessaire pour générer le 4e sommet des rectangles
+    bool packedNormal = false;    // normale compressée 11-11-10 (constante de spécialisation R11G11B10_NORMAL)
 };
 
 static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
 {
     bool ok = true;
+    // Un mini-fetch (dword 1 bit 30) n'a ni constante de fetch ni pas : il reprend ceux du dernier fetch complet
+    uint32_t lastConst = 0, lastStride = 0;
     ForEachVertexFetch(s_vsUcode.data(), uint32_t(s_vsUcode.size()), [&](uint32_t address, const uint32_t* w) {
-        uint32_t location = UINT32_MAX;
-        for (auto& [a, loc] : s_vs->fetchLocations) if (a == address) location = loc;
-        if (location == UINT32_MAX || layout.attributeCount >= 16) return;   // mini-fetch ou attribut non déclaré
-        uint32_t constIndex = ((w[0] >> 20) & 0x1F) * 3 + ((w[0] >> 25) & 3);
-        uint32_t format = (w[1] >> 16) & 0x3F, stride = (w[2] & 0xFF) * 4;
+        bool mini = (w[1] >> 30) & 1;
+        if (!mini) { lastConst = ((w[0] >> 20) & 0x1F) * 3 + ((w[0] >> 25) & 3); lastStride = (w[2] & 0xFF) * 4; }
+        // Correspondance par registre et composantes écrites ; à défaut, par registre seul
+        uint32_t location = UINT32_MAX, fetchKey = VertexFetchKey(w);
+        for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == fetchKey) location = loc;
+        if (location == UINT32_MAX)
+            for (auto& [k, loc] : s_vs->fetchRegLocations) if ((k & 0xFF) == (fetchKey & 0xFF)) location = loc;
+        static bool flog = getenv("IKARUGA_FETCHLOG");
+        if (flog)
+        {
+            static std::unordered_map<uint64_t, int> seen;
+            static std::unordered_map<uint64_t, int> seenVs;
+            if (!seenVs[s_vs->containerHash]++)
+                for (auto& [fa, fl] : s_vs->fetchLocations) KLOG("  table vs %016llx : adresse %u -> emplacement %u", (unsigned long long)s_vs->containerHash, fa, fl);
+            if (!seen[s_vs->containerHash ^ (uint64_t(address) << 40)]++)
+                KLOG("vfetch vs %016llx adr %u mini %d format %u offset %d dst r%u swz %03X stride %u -> emplacement %d | %08X %08X %08X", (unsigned long long)s_vs->containerHash, address, mini,
+                    (w[1] >> 16) & 0x3F, int32_t(w[2] << 1) >> 9, (w[0] >> 12) & 0x3F, w[1] & 0xFFF, w[2] & 0xFF, int(location), w[0], w[1], w[2]);
+        }
+        if (location == UINT32_MAX || layout.attributeCount >= 16) return;   // attribut non déclaré
+        uint32_t constIndex = lastConst;
+        uint32_t format = (w[1] >> 16) & 0x3F, stride = lastStride;
         int32_t offset = int32_t(w[2] << 1) >> 9;   // 23 bits signés, en dwords
         VkFormat vk = VertexFormat(format, (w[1] >> 12) & 1, ((w[1] >> 13) & 1) == 0);
+        // NORMAL, TANGENT, BINORMAL (emplacements 1-3) et BLENDINDICES (9) sont des uint4 dans le SPIR-V : bits bruts
+        if (location >= 1 && location <= 3)
+        {
+            if (format == 16 || format == 17 || format == 7) { layout.packedNormal |= location == 1; vk = VK_FORMAT_R32_UINT; }
+            else if (format == 36) vk = VK_FORMAT_R32_UINT;
+            else if (format == 37) vk = VK_FORMAT_R32G32_UINT;
+            else if (format == 57) vk = VK_FORMAT_R32G32B32_UINT;
+            else if (format == 38) vk = VK_FORMAT_R32G32B32A32_UINT;
+        }
+        else if (location == 9 && format == 6) vk = VK_FORMAT_R8G8B8A8_UINT;
         if (vk == VK_FORMAT_UNDEFINED) { KLOG("rendu : format de sommet %u non géré", format); ok = false; return; }
         if (format < 36) layout.allFloat32 = false;
+        static bool vlog = getenv("IKARUGA_VTXLOG");
+        if (vlog)
+        {
+            static std::unordered_map<uint32_t, int> seen;
+            uint32_t endian = regs[FETCH_CONSTANTS + constIndex * 2 + 1] & 3;
+            if (!seen[format | endian << 8]++) KLOG("sommets : format %u endian %u (fetch %u, ps %016llx)", format, endian, constIndex, (unsigned long long)(s_ps ? s_ps->containerHash : 0));
+        }
         uint32_t binding = 0;
         while (binding < layout.bindingCount && layout.fetchConst[binding] != constIndex) binding++;
         if (binding == layout.bindingCount)
@@ -539,6 +580,8 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     ds.pDynamicStates = dyn;
     VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     dss.depthTestEnable = (depthControl >> 1) & 1;
+    static const bool noDepth = getenv("IKARUGA_NODEPTH");   // débogage
+    if (noDepth) dss.depthTestEnable = false;
     dss.depthWriteEnable = dss.depthTestEnable && ((depthControl >> 2) & 1);
     static const VkCompareOp ops[] = { VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL,
         VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS };
@@ -617,6 +660,56 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
         { key = base; dy += int32_t((destBase - base) / row); w = res.width; h = res.height; break; }
     }
 
+    // Resolve de la profondeur (source 4) : le décor relit la profondeur de la scène (texture 24_8_FLOAT) ;
+    // sans elle il échantillonnait la texture blanche (profondeur 1 partout) et ses surfaces devenaient unies.
+    // Vulkan ne copie pas une image de profondeur vers une image couleur : on passe par un tampon.
+    if (source == 4 && command != 3 && destBase && w && h && x1 > x0 && y1 > y0)
+    {
+        Resolved& r = s_resolved[key];
+        if (!r.image.image || r.width != w || r.height != h || r.format != VK_FORMAT_R32_SFLOAT)
+        {
+            r.image = CreateImage(w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_R32_SFLOAT);
+            r.width = w; r.height = h; r.format = VK_FORMAT_R32_SFLOAT; r.bpp = bpp;
+            if (!r.descriptor) r.descriptor = s_nextDescriptor++;
+            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
+            vkUpdateDescriptorSets(s_dev, 1, &wr, 0, nullptr);
+            KLOG("rendu : resolve profondeur -> %08X (%ux%u)", destBase, w, h);
+        }
+        static VkBuffer buf;
+        static constexpr VkDeviceSize kSize = VkDeviceSize(1280) * kTargetHeight * 4;
+        if (!buf)
+        {
+            VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+            bi.size = kSize;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            vkCreateBuffer(s_dev, &bi, nullptr, &buf);
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(s_dev, buf, &req);
+            vkBindBufferMemory(s_dev, buf, Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), 0);
+        }
+        dx = std::max(dx, 0); dy = std::max(dy, 0);
+        uint32_t cw = uint32_t(std::min(x1 - x0, int32_t(w) - dx)), ch = uint32_t(std::min(y1 - y0, int32_t(h) - dy));
+        if (int32_t(cw) > 0 && int32_t(ch) > 0 && VkDeviceSize(cw) * ch * 4 <= kSize)
+        {
+            Transition(depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            VkBufferImageCopy c{};
+            c.imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+            c.imageOffset = { x0, y0, 0 };
+            c.imageExtent = { cw, ch, 1 };
+            vkCmdCopyImageToBuffer(s_cmd, depth.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+            VkBufferMemoryBarrier bb{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.buffer = buf; bb.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+            Transition(r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            c.imageOffset = { dx, dy, 0 };
+            vkCmdCopyBufferToImage(s_cmd, buf, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+            Transition(r.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+    }
     if (source < 4 && command != 3 && destBase && w && h && x1 > x0 && y1 > y0)
     {
         Resolved& r = s_resolved[key];
@@ -669,7 +762,7 @@ static TextureFormatInfo TextureFormat(uint32_t fmt)
     {
     case 2:  return { VK_FORMAT_R8_UNORM, 1, 1 };                    // k_8
     case 4:  return { VK_FORMAT_R5G6B5_UNORM_PACK16, 1, 2 };         // k_5_6_5
-    case 6:  return { VK_FORMAT_B8G8R8A8_UNORM, 1, 4 };              // k_8_8_8_8 (ARGB big-endian)
+    case 6:  return { VK_FORMAT_R8G8B8A8_UNORM, 1, 4 };              // k_8_8_8_8 (ordre des canaux : swizzle de la fetch constant, comme Xenia)
     case 10: return { VK_FORMAT_R8G8_UNORM, 1, 2 };                  // k_8_8
     case 15: return { VK_FORMAT_B4G4R4A4_UNORM_PACK16, 1, 2 };       // k_4_4_4_4
     case 24: return { VK_FORMAT_R16_UNORM, 1, 2 };                   // k_16
@@ -743,9 +836,9 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
         // Combinaisons distinctes : format, signes (3 = gamma), exp_adjust, filtres mag/min/mip, niveaux de mip
         static std::unordered_map<uint64_t, int> seen;
         int exp = int32_t(f[3] << 13) >> 26;
-        uint64_t k = (f[1] & 0x3F) | uint64_t((f[0] >> 2) & 0xFF) << 8 | uint64_t(exp & 0x3F) << 16 | uint64_t((f[3] >> 19) & 0x3F) << 24 | uint64_t((f[4] >> 2) & 0xFF) << 32;
-        if (!seen[k]++) KLOG("texture : format %u signes %02X exp %d filtres mag %u min %u mip %u, mips %u-%u, %ux%u, pix_center %u",
-            f[1] & 0x3F, (f[0] >> 2) & 0xFF, exp, (f[3] >> 19) & 3, (f[3] >> 21) & 3, (f[3] >> 23) & 3, (f[4] >> 2) & 15, (f[4] >> 6) & 15,
+        uint64_t k = uint64_t((f[0] >> 10) & 0x1FF) << 48 | (f[1] & 0x3F) | uint64_t((f[0] >> 2) & 0xFF) << 8 | uint64_t(exp & 0x3F) << 16 | uint64_t((f[3] >> 19) & 0x3F) << 24 | uint64_t((f[4] >> 2) & 0xFF) << 32;
+        if (!seen[k]++) KLOG("texture : adressage %o format %u signes %02X exp %d filtres mag %u min %u mip %u, mips %u-%u, %ux%u, pix_center %u",
+            (f[0] >> 10) & 0x1FF, f[1] & 0x3F, (f[0] >> 2) & 0xFF, exp, (f[3] >> 19) & 3, (f[3] >> 21) & 3, (f[3] >> 23) & 3, (f[4] >> 2) & 15, (f[4] >> 6) & 15,
             (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, 0u);
     }
     uint32_t format = f[1] & 0x3F, endian = (f[1] >> 6) & 3, base = (f[1] >> 12) << 12;
@@ -809,6 +902,14 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
         else levels = 1;
     }
 
+    // Débogage : IKARUGA_TEXDUMP=1 -> écrit chaque texture dé-tuilée (build/tex/<format>_<l>x<h>_<n>.bin)
+    static bool texDump = getenv("IKARUGA_TEXDUMP");
+    if (texDump)
+    {
+        static int n;
+        char name[128]; snprintf(name, sizeof name, "build/tex/%u_%ux%u_%04d_%s.bin", format, width, height, n++, tiled ? "t" : "l");
+        if (FILE* fd = fopen(name, "wb")) { fwrite(dst, 1, size_t(rowBytes) * bh, fd); fclose(fd); }
+    }
     bool created = it == s_textures.end();
     CachedTexture& t = s_textures[key];
     if (created)
@@ -902,13 +1003,20 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
     return t.descriptor;
 }
 
-// Sampler : filtre (mag), adressage (X) et filtre de mip (1 = linéaire) de la fetch constant
+// Sampler : filtre (mag), adressage X/Y et filtre de mip (1 = linéaire) de la fetch constant.
+// Adressage Xenos (3 bits par axe) : 0 répétition, 1 miroir, 2/4 bord, 3/5 miroir puis bord, 6/7 bordure.
+// Le jeu utilise le miroir pour ses textures répétées (rails, panneaux) : en "bord" elles s'étiraient.
+static uint32_t AddressMode(uint32_t clamp)
+{
+    static const uint32_t map[8] = { 0, 1, 2, 1, 2, 1, 3, 3 };
+    return map[clamp & 7];
+}
+
 static uint32_t GetSampler(const uint32_t* f)
 {
     bool point = ((f[3] >> 19) & 3) == 0;
-    bool wrap = ((f[0] >> 10) & 7) == 0;
     bool mipLinear = ((f[3] >> 23) & 3) == 1;
-    return (point ? 1 : 0) | (wrap ? 2 : 0) | (mipLinear ? 4 : 0);
+    return (point ? 1 : 0) | AddressMode(f[0] >> 10) << 1 | AddressMode(f[0] >> 13) << 3 | (mipLinear ? 32 : 0);
 }
 
 // ------------------------------------------------------------------ dessin
@@ -1043,6 +1151,11 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         const uint32_t* f = regs + FETCH_CONSTANTS + slot * 6;
         if ((f[0] & 3) != 2) continue;
         uint32_t tex = GetTexture(f, phys), smp = GetSampler(f);
+        extern uint64_t g_presentCount;
+        static uint64_t texFrom = getenv("IKARUGA_DRAWTEX") ? strtoull(getenv("IKARUGA_DRAWTEX"), nullptr, 10) : 0;
+        if (texFrom && g_presentCount == texFrom)
+            KLOG("dessin ps %016llx emplacement %u : base %08X format %u %ux%u swizzle %03X adressage %o -> descripteur %u sampler %u",
+                (unsigned long long)s_ps->containerHash, slot, (f[1] >> 12) << 12, f[1] & 0x3F, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, (f[3] >> 1) & 0xFFF, (f[0] >> 10) & 0x1FF, tex, smp);
         memcpy(shared + slot * 4, &tex, 4);
         memcpy(shared + 192 + slot * 4, &smp, 4);
     }
@@ -1063,7 +1176,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     uint32_t spec = 0;
     if ((colorControl & 8) && (s_ps->specConstantsMask & 2)) spec |= 2;   // test alpha (fonction "supérieur ou égal" supposée)
     BeginTargets(regs);
-    VkPipeline pipeline = GetPipeline(regs, layout, topology, spec | (s_vs->specConstantsMask & 1), edramMode == 5);
+    VkPipeline pipeline = GetPipeline(regs, layout, topology, spec | ((s_vs->specConstantsMask & 1) && layout.packedNormal ? 1 : 0), edramMode == 5);
     if (!pipeline) return;
     uint32_t tw = s_curColor->width, th = s_curColor->height;
 

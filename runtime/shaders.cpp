@@ -138,6 +138,13 @@ const TranslatedShader* ShaderLookup(const uint8_t* ucode, uint32_t sizeBytes, b
             int loc = UsageLocation((el >> 12) & 0xF, (el >> 16) & 0xF);
             if (loc >= 0) t.fetchLocations.push_back({ el & 0xFFF, uint32_t(loc) });
         }
+        // Microcode d'origine du conteneur : adresse du vfetch -> registre de destination
+        uint32_t so = Be32(c + 24), po = Be32(c + so), size = Be32(c + so + 4), vsSize = Be32(c + 4);
+        std::vector<uint32_t> w = LoadWords(c + vsSize + po, size);
+        WalkFetches(w, [&](uint32_t address, uint32_t at) {
+            for (auto& [a, loc] : t.fetchLocations)
+                if (a == address) t.fetchRegLocations.push_back({ VertexFetchKey(&w[at]), loc });
+        });
     }
     const uint8_t* smol = s_spirvBlob.data() + e->second->spirvOffset;
     size_t outSize = smolv::GetDecodedBufferSize(smol, e->second->spirvSize);
