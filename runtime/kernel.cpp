@@ -501,6 +501,10 @@ KFUNC(NtReadFile)   // (handle, event, apc, apcCtx, iosb, buffer, length, pOffse
     size_t n = fread(g_base + ARG(8), 1, ARG(9), file->f);
     Wr32(ARG(7), n ? STATUS_SUCCESS : STATUS_END_OF_FILE); Wr32(ARG(7) + 4, (uint32_t)n);
     if (ARG(4)) if (auto ev = FromHandle(ARG(4))) ev->Signal();
+    static int logged;
+    if (getenv("IKARUGA_IOLOG") && logged++ < 40)
+        KLOG("NtReadFile %s : %u octets à %lld -> %zu (event %08X, apc %08X, ctx %08X)", file->path.filename().string().c_str(),
+            ARG(9), ARG(10) ? (long long)Rd64(ARG(10)) : -1ll, n, ARG(4), ARG(5), ARG(6));
     RET(n ? STATUS_SUCCESS : STATUS_END_OF_FILE);
 }
 
@@ -606,7 +610,7 @@ static uint16_t KeyboardButtons()
     {
         static uint32_t calls;
         uint32_t period = std::max(1, atoi(autoStart)) * 4;
-        if (calls++ % period < 4) b |= 0x10;
+        if (calls++ % period < 4) b |= 0x10 | 0x1000;   // START + A
     }
     return b;
 }
@@ -874,3 +878,73 @@ KFUNC(XAudioUnregisterRenderDriverClient) { s_audioCallback = 0; RET(0); }
 KFUNC(XAudioSubmitRenderDriverFrame) { RET(0); }
 KFUNC(XAudioGetVoiceCategoryVolume) { if (ARG(4)) Wr32(ARG(4), 0x3F800000); RET(0); }   // 1.0f
 KFUNC(XAudioGetVoiceCategoryVolumeChangeMask) { if (ARG(4)) Wr32(ARG(4), 0); RET(0); }
+
+// Base de temps PowerPC (instruction mftb) : 50 MHz comme sur Xbox 360, cohérente avec
+// KeQueryPerformanceFrequency (les jeux n'en lisent souvent que 32 bits)
+extern "C" uint64_t GuestTimebase()
+{
+    static const auto start = std::chrono::steady_clock::now();
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    return uint64_t(ns) / 20;
+}
+
+KFUNC(XamUserGetSigninInfo)   // (user, flags, XUSER_SIGNIN_INFO*) : joueur 1 connecté localement
+{
+    memset(g_base + ARG(5), 0, 0x28);
+    if (ARG(3) != 0) RET(0x525);   // ERROR_NO_SUCH_USER
+    Wr64(ARG(5), 0xE000000000000001ull);    // xuid
+    Wr32(ARG(5) + 0xC, 1);                  // XUserSigninState_SignedInLocally
+    strcpy((char*)g_base + ARG(5) + 0x18, "Joueur");
+    RET(0);
+}
+
+KFUNC(XamContentGetLicenseMask)   // (pMask, overlapped) : jeu acheté (licence complète)
+{
+    Wr32(ARG(3), 0xFFFFFFFF);
+    RET(0);
+}
+
+// Fin immédiate d'une opération XAM asynchrone (XAM_OVERLAPPED : résultat, longueur, contexte, event)
+static uint32_t CompleteOverlapped(uint32_t ov, uint32_t result, uint32_t length = 0)
+{
+    Wr32(ov, result);
+    Wr32(ov + 4, length);
+    Wr32(ov + 0x14, result);   // erreur étendue
+    if (uint32_t ev = Rd32(ov + 0xC))
+    {
+        if (auto o = FromHandle(ev)) o->Signal();
+        else FromDispatcher(ev)->Signal();
+    }
+    return 0x3E5;   // ERROR_IO_PENDING
+}
+
+// Réglages du profil : on répond "non défini" pour chaque réglage, le jeu prend alors ses valeurs par défaut
+KFUNC(XamUserReadProfileSettings)   // (titre, joueur, nbXuid, xuids, nb, ids, pTaille, tampon, overlapped en pile)
+{
+    uint32_t count = ARG(7), ids = ARG(8), sizePtr = ARG(9), buffer = ARG(10);
+    uint32_t overlapped = Rd32(ctx.r1.u32 + 0x54);
+    if (count < 1 || count > 32 || !sizePtr) RET(0x57);   // ERROR_INVALID_PARAMETER
+    uint32_t needed = 8;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint32_t id = Rd32(ids + i * 4), type = (id >> 28) & 0xF;
+        needed += 0x28 + ((type == 4 || type == 6) ? (id >> 16) & 0xFFF : 0);
+    }
+    if (!buffer || Rd32(sizePtr) < needed)
+    {
+        if (!Rd32(sizePtr)) Wr32(sizePtr, needed);
+        RET(0x7A);   // ERROR_INSUFFICIENT_BUFFER
+    }
+    memset(g_base + buffer, 0, needed);
+    Wr32(buffer, count);
+    Wr32(buffer + 4, buffer + 8);
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint32_t s = buffer + 8 + i * 0x28;
+        Wr32(s + 8, ARG(4));                      // joueur
+        Wr32(s + 0x10, Rd32(ids + i * 4));        // identifiant du réglage (from = 0 : non défini)
+    }
+    KLOG("XamUserReadProfileSettings : %u réglages (non définis)", count);
+    if (overlapped) RET(CompleteOverlapped(overlapped, 0, needed));
+    RET(0);
+}

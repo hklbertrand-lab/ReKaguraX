@@ -501,6 +501,7 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
     if ((f[0] & 3) != 2) return 0;
     uint32_t format = f[1] & 0x3F, endian = (f[1] >> 6) & 3, base = (f[1] >> 12) << 12;
     uint32_t width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1, dim = (f[5] >> 9) & 3;
+    if (dim == 0) { width = (f[2] & 0xFFFFFF) + 1; height = 1; dim = 1; }   // 1D : texture 2D d'une ligne
     uint32_t pitch = ((f[0] >> 22) & 0x1FF) << 5;
     bool tiled = f[0] >> 31;
     TextureFormatInfo info = TextureFormat(format);
@@ -686,7 +687,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     }
     VkDeviceSize vsConst = Upload(regs + ALU_CONSTANTS, 4096, 256);
     VkDeviceSize psConst = Upload(regs + ALU_CONSTANTS + 256 * 4, 3584, 256);
-    uint8_t shared[512]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha
+    uint8_t shared[1024]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha, boucles
     // Textures du pixel shader : l'échantillonneur n lit la fetch constant n ; indices 2D en c0-c3, samplers en c12-c15
     for (uint32_t slot = 0; slot < 16; slot++)
     {
@@ -699,6 +700,13 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     uint32_t booleans = (regs[BOOL_CONSTANTS] & 0xFFFF) | ((regs[BOOL_CONSTANTS + 4] & 0xFFFF) << 16);
     memcpy(shared + 256, &booleans, 4);
     memcpy(shared + 272, &regs[RB_ALPHA_REF], 4);
+    // Constantes de boucle (g_LoopConst) : nombre, début, pas signé, à partir de l'octet 512
+    for (uint32_t n = 0; n < 32; n++)
+    {
+        uint32_t v = regs[BOOL_CONSTANTS + 8 + n];
+        int32_t loop[4] = { int32_t(v & 0xFF), int32_t((v >> 8) & 0xFF), int32_t(int8_t((v >> 16) & 0xFF)), 0 };
+        memcpy(shared + 512 + n * 16, loop, 16);
+    }
     VkDeviceSize sharedConst = Upload(shared, sizeof(shared), 256);
     uint64_t push[3] = { s_uploadAddr + vsConst, s_uploadAddr + psConst, s_uploadAddr + sharedConst };
 

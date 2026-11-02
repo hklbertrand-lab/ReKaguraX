@@ -1,7 +1,16 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..c014d39 100644
+index fa91527..bc5f77a 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
+@@ -1260,7 +1260,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++        println("\t{}.u64 = GuestTimebase();", r(insn.operands[0]));   // Ikaruga : horloge 50 MHz émulée
+         break;
+ 
+     case PPC_INST_MR:
 @@ -2249,6 +2249,160 @@ bool Recompiler::Recompile(
  
          break;
@@ -163,3 +172,17 @@ index fa91527..c014d39 100644
      case PPC_INST_XOR:
          println("\t{}.u64 = {}.u64 ^ {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          if (strchr(insn.opcode->name, '.'))
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..42e4cf4 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -115,6 +115,9 @@
+ 
+ typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
+ 
++// Ikaruga : base de temps PowerPC (mftb) à 50 MHz, fournie par le runtime
++extern "C" uint64_t GuestTimebase();
++
+ struct PPCFuncMapping
+ {
+     size_t guest;
