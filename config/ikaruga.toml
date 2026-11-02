@@ -31,7 +31,8 @@ longjmp_address = 0x8267E350
 # Petit stub (mtctr/bctr) collé après __restgprlr_31, sinon nommé en double __restgprlr_30
 # Fonctions dont les blocs de switch suivent la table de saut intégrée au code : sans bornes explicites,
 # XenonRecomp coupe la fonction à la table et les cas deviennent des "return" (ex. 824C9BD8 = état d'une
-# cue XACT, toujours 0 -> aucun son). 82587718/82587BF8 et 825A8E90/825A8FD4 se chevauchent : à analyser.
+# cue XACT, toujours 0 -> aucun son). 82587BF8 et 825A8FD4 ne sont que des cas de switch (une seule référence :
+# la table) : fusionnés dans 82587718 et 825A8E90 (rendu des glyphes de police, qui sortaient rayés).
 functions = [
     { address = 0x821E0074, size = 0x14 },
     { address = 0x8219E208, size = 0x37C },
@@ -50,6 +51,8 @@ functions = [
     { address = 0x824C9BD8, size = 0x94 },
     { address = 0x824E8260, size = 0x144 },
     { address = 0x825A86F0, size = 0xB0 },
+    { address = 0x82587718, size = 0x810 },
+    { address = 0x825A8E90, size = 0x1FC },
     { address = 0x82648A00, size = 0x11C },
     { address = 0x82648B20, size = 0x174 },
 ]

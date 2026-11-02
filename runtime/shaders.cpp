@@ -119,7 +119,13 @@ const TranslatedShader* ShaderLookup(const uint8_t* ucode, uint32_t sizeBytes, b
 
     TranslatedShader& t = s_decoded[key];
     auto u = s_byUcode.find(key);
-    if (u == s_byUcode.end()) { KLOG("shader %s inconnu (microcode %u octets)", pixel ? "PS" : "VS", sizeBytes); return nullptr; }
+    if (u == s_byUcode.end())
+    {
+        KLOG("shader %s inconnu (microcode %u octets, clé %016llx)", pixel ? "PS" : "VS", sizeBytes, (unsigned long long)key);
+        char name[96]; snprintf(name, sizeof name, "build/shaders/inconnu_%s_%016llx.bin", pixel ? "ps" : "vs", (unsigned long long)key);
+        if (FILE* f = fopen(name, "wb")) { fwrite(ucode, 1, sizeBytes, f); fclose(f); }
+        return nullptr;
+    }
     auto e = s_byContainer.find(u->second);
     if (e == s_byContainer.end() || !e->second->spirvSize) { KLOG("shader %016llx sans SPIR-V", (unsigned long long)u->second); return nullptr; }
 

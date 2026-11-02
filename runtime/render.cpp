@@ -1034,7 +1034,19 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     uint32_t edramMode = regs[RB_MODECONTROL] & 7;
     if (edramMode == 6) { Resolve(regs, phys); return; }   // mode copie : c'est un resolve
     if (edramMode != 4 && edramMode != 5) return;    // 4 = couleur + profondeur, 5 = profondeur seule
-    if (!s_vs || !s_ps) return;
+    if (!s_vs || !s_ps)
+    {
+        // Débogage : dessins perdus faute de shader traduit (IKARUGA_DRAWTEX=n)
+        extern uint64_t g_presentCount;
+        static uint64_t texFrom = getenv("IKARUGA_DRAWTEX") ? strtoull(getenv("IKARUGA_DRAWTEX"), nullptr, 10) : 0;
+        if (texFrom && g_presentCount == texFrom)
+        {
+            const uint32_t* f = regs + FETCH_CONSTANTS;
+            KLOG("dessin perdu (vs %s, ps %s) prim %u, %u sommets, texture 0 : base %08X format %u %ux%u", s_vs ? "ok" : "absent", s_ps ? "ok" : "absent",
+                initiator & 0x3F, initiator >> 16, (f[1] >> 12) << 12, f[1] & 0x3F, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1);
+        }
+        return;
+    }
 
     uint32_t prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
     if (source == 1) { static int warned; if (!warned++) KLOG("rendu : index immédiats non gérés"); return; }
@@ -1101,6 +1113,13 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     {
         uint32_t d0 = regs[FETCH_CONSTANTS + layout.fetchConst[b] * 2], d1 = regs[FETCH_CONSTANTS + layout.fetchConst[b] * 2 + 1];
         uint32_t base = d0 & ~3u, sizeBytes = ((d1 >> 2) & 0xFFFFFF) * 4, stride = layout.bindings[b].stride;
+        // Dessin non indexé : les index générés partent de VGT_INDX_OFFSET (sommet de départ de DrawPrimitive) ;
+        // sans lui, deux icônes d'un même tampon lisaient toutes deux les sommets de la première
+        if (!indexed && stride)
+        {
+            uint32_t skip = std::min(regs[0x2102] * stride, sizeBytes);
+            base += skip; sizeBytes -= skip;
+        }
         uint32_t needed = stride ? stride * fetchCount : sizeBytes;
         uint32_t bytes = std::min(needed, sizeBytes ? sizeBytes : needed);
         uint32_t outVertices = prim == 8 ? count / 3 * 4 : fetchCount;
@@ -1162,6 +1181,19 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     uint32_t booleans = (regs[BOOL_CONSTANTS] & 0xFFFF) | ((regs[BOOL_CONSTANTS + 4] & 0xFFFF) << 16);
     memcpy(shared + 256, &booleans, 4);
     memcpy(shared + 272, &regs[RB_ALPHA_REF], 4);
+    // Demi-pixel D3D9 (PA_SU_VTX_CNTL.pix_center = 0) : Xenos place les centres de pixels sur les entiers,
+    // Vulkan à +0,5 ; sans décalage, un texte affiché 1:1 est échantillonné entre deux texels (rayures)
+    if (!(regs[0x2302] & 1))
+    {
+        float vxs, vys;
+        memcpy(&vxs, &regs[PA_CL_VPORT_XSCALE], 4); memcpy(&vys, &regs[PA_CL_VPORT_YSCALE], 4);
+        if (!(regs[PA_CL_VTE_CNTL] & 1) || vxs == 0) { vxs = 640; vys = -360; }
+        static float sx = 1, sy = -1;
+        static bool parsed = [] { if (const char* e = getenv("IKARUGA_HPO")) sscanf(e, "%f,%f", &sx, &sy); return true; }();
+        (void)parsed;
+        float hpo[2] = { sx * 0.5f / std::fabs(vxs), sy * 0.5f / std::fabs(vys) };
+        memcpy(shared + 264, hpo, 8);
+    }
     // Constantes de boucle (g_LoopConst) : nombre, début, pas signé, à partir de l'octet 512
     for (uint32_t n = 0; n < 32; n++)
     {
