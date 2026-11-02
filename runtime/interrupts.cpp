@@ -10,6 +10,8 @@
 #include <deque>
 #include <vector>
 
+void KernelWakeWaiters();
+
 struct PendingInterrupt
 {
     uint32_t callback, source, arg;
@@ -96,6 +98,9 @@ bool InterruptsDeliver(uint32_t cpu, uint32_t callback, uint32_t source, uint32_
     if (!hasThread) { s_noThread[cpu]++; return false; }
     s_queues[cpu].push_back(&p);
     s_pending[cpu]++;
+    l.unlock();
+    KernelWakeWaiters();
+    l.lock();
     if (!s_doneCv.wait_for(l, std::chrono::milliseconds(20), [&] { return p.taken; }))
     {
         // Personne n'a pris l'interruption à temps : on la retire et l'appelant l'exécute

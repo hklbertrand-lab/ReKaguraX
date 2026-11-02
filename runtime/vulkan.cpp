@@ -3,6 +3,8 @@
 #include "guest.h"
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <vector>
 
 static VkInstance s_instance;
@@ -18,6 +20,12 @@ static std::vector<VkImage> s_images;
 static VkCommandPool s_pool;
 static VkCommandBuffer s_cmd;
 static VkSemaphore s_acquired, s_rendered;
+// Deux images en vol : le thread GPU enregistre l'image n+1 pendant que la carte exécute l'image n
+static constexpr uint32_t kFrames = 2;
+static VkCommandBuffer s_cmds[kFrames];
+static VkFence s_fences[kFrames];
+static VkSemaphore s_acquireds[kFrames], s_rendereds[kFrames];
+static uint32_t s_cur;
 static VkFence s_fence;
 static SDL_Window* s_window;
 static std::mutex s_mutex;
@@ -169,14 +177,18 @@ bool VulkanInit(SDL_Window* window)
     VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     cai.commandPool = s_pool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(s_device, &cai, &s_cmd));
+    cai.commandBufferCount = kFrames;
+    VK_CHECK(vkAllocateCommandBuffers(s_device, &cai, s_cmds));
     VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    vkCreateSemaphore(s_device, &sci, nullptr, &s_acquired);
-    vkCreateSemaphore(s_device, &sci, nullptr, &s_rendered);
     VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(s_device, &fci, nullptr, &s_fence);
+    for (uint32_t i = 0; i < kFrames; i++)
+    {
+        vkCreateSemaphore(s_device, &sci, nullptr, &s_acquireds[i]);
+        vkCreateSemaphore(s_device, &sci, nullptr, &s_rendereds[i]);
+        vkCreateFence(s_device, &fci, nullptr, &s_fences[i]);
+    }
+    s_cmd = s_cmds[0]; s_fence = s_fences[0]; s_acquired = s_acquireds[0]; s_rendered = s_rendereds[0];
 
     return CreateSwapchain();
 }
@@ -201,7 +213,11 @@ VkCommandBuffer VulkanFrameCmd()
 {
     if (!s_recording)
     {
+        s_cmd = s_cmds[s_cur]; s_fence = s_fences[s_cur]; s_acquired = s_acquireds[s_cur]; s_rendered = s_rendereds[s_cur];
+        auto t0 = std::chrono::steady_clock::now();
         vkWaitForFences(s_device, 1, &s_fence, VK_TRUE, UINT64_MAX);
+        extern std::atomic<uint64_t> g_gpuWaitUs[4];
+        g_gpuWaitUs[2] += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
         vkResetCommandBuffer(s_cmd, 0);
         VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -225,6 +241,7 @@ void VulkanImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, 
 }
 
 VkDevice VulkanDevice() { return s_device; }
+uint32_t VulkanFrameSlot() { return s_cur; }
 VkPhysicalDevice VulkanPhysicalDevice() { return s_physical; }
 uint32_t VulkanFindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags) { return FindMemoryType(bits, flags); }
 
@@ -237,7 +254,10 @@ void VulkanPresentFrame(VkImage src, uint32_t width, uint32_t height)
     VulkanFrameCmd();
 
     uint32_t index;
+    auto t0 = std::chrono::steady_clock::now();
     VkResult res = vkAcquireNextImageKHR(s_device, s_swapchain, UINT64_MAX, s_acquired, VK_NULL_HANDLE, &index);
+    extern std::atomic<uint64_t> g_gpuWaitUs[4];
+    g_gpuWaitUs[3] += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     if (res == VK_ERROR_OUT_OF_DATE_KHR)
     {
         // Image perdue : on soumet quand même le travail enregistré, sans présenter
@@ -248,6 +268,7 @@ void VulkanPresentFrame(VkImage src, uint32_t width, uint32_t height)
         vkResetFences(s_device, 1, &s_fence);
         vkQueueSubmit(s_queue, 1, &submit, s_fence);
         s_recording = false;
+        s_cur = (s_cur + 1) % kFrames;
         vkDeviceWaitIdle(s_device); CreateSwapchain();
         return;
     }
@@ -297,6 +318,7 @@ void VulkanPresentFrame(VkImage src, uint32_t width, uint32_t height)
         Barrier(s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(s_cmd);
     s_recording = false;
+    s_cur = (s_cur + 1) % kFrames;
 
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };

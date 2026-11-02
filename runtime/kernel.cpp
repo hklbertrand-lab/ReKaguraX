@@ -2,6 +2,7 @@
 #include "guest.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -114,6 +115,14 @@ static std::shared_ptr<KObject> FromHandle(uint32_t h)
 // modifient aussi directement en mémoire. Les attentes interrogent cet état (réveil par condition + 2 ms).
 static std::mutex s_dispatchMutex;
 static std::condition_variable s_dispatchCv;
+
+// Une interruption vient d'être déposée : les threads en attente noyau se réveillent pour la prendre
+// (sinon elle attend la fin de leur tranche d'attente et bloque l'émetteur, GPU compris)
+void KernelWakeWaiters()
+{
+    { std::lock_guard lock(s_dispatchMutex); }
+    s_dispatchCv.notify_all();
+}
 
 struct KGuestDispatcher : KObject
 {
@@ -396,7 +405,8 @@ static uint32_t WaitMultiple(std::vector<std::shared_ptr<KObject>> objs, bool wa
             start = std::chrono::steady_clock::now() + std::chrono::hours(1000);
         }
         InterruptsPollCurrent();
-        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        std::unique_lock lock(s_dispatchMutex);
+        s_dispatchCv.wait_for(lock, std::chrono::microseconds(500));
     }
 }
 
@@ -943,9 +953,10 @@ KFUNC(VdSetGraphicsInterruptCallback)
             GuestInitThreadContext(ctx, 0x10000);
             DebugRegisterThread("vblank");
             auto next = std::chrono::steady_clock::now();
+            static const int periodUs = getenv("IKARUGA_VBLANK_US") ? atoi(getenv("IKARUGA_VBLANK_US")) : 16667;   // débogage
             for (;;)
             {
-                next += std::chrono::microseconds(16667);
+                next += std::chrono::microseconds(periodUs);
                 std::this_thread::sleep_until(next);
                 if (uint32_t cb = s_gfxCallback)
                 {
@@ -973,6 +984,17 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
     GpuOnSwap();
     if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());
+    static bool timing = getenv("IKARUGA_TIMING");
+    if (timing && s_frames % 120 == 0)
+    {
+        extern std::atomic<uint64_t> g_gpuWaitUs[4];
+        static auto last = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - last).count() / 120; last = now;
+        auto take = [](int i) { return g_gpuWaitUs[i].exchange(0) / 120000.0; };
+        KLOG("timing : %.2f ms/img | GPU attend : wait_reg_mem %.2f, interruptions %.2f, fence %.2f, acquire %.2f",
+            ms, take(0), take(1), take(2), take(3));
+    }
     RET(0);
 }
 

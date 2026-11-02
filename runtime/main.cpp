@@ -12,8 +12,10 @@
 #include <chrono>
 #include <vector>
 #include <filesystem>
+#include <map>
 #ifdef _WIN32
 #include <windows.h>
+#include <timeapi.h>
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -274,6 +276,47 @@ int main(int argc, char** argv)
                     ResumeThread(h);
                 }
             }
+        }).detach();
+    }
+    // Profilage : IKARUGA_PROFILE=s -> échantillonne tous les threads ~1 kHz pendant s secondes (après 60 s),
+    // puis écrit build/profile.txt (thread, exe+décalage, nombre) à symboliser avec llvm-symbolizer
+    if (const char* prof = getenv("IKARUGA_PROFILE"))
+    {
+        int seconds = std::max(1, atoi(prof));
+        std::thread([seconds] {
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            extern uint64_t g_presentCount;
+            uint64_t frames0 = g_presentCount;
+            KLOG("profilage pendant %d s", seconds);
+            timeBeginPeriod(1);
+            std::map<std::pair<std::string, uint64_t>, uint32_t> hist;
+            std::map<std::string, uint32_t> total;
+            auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+            while (std::chrono::steady_clock::now() < end)
+            {
+                std::vector<std::pair<std::string, HANDLE>> threads{ { "principal", s_gameThread.load() } };
+                { std::lock_guard l(s_debugThreadsMutex); threads.insert(threads.end(), s_debugThreads.begin(), s_debugThreads.end()); }
+                for (auto& [name, h] : threads)
+                {
+                    if (SuspendThread(h) == DWORD(-1)) continue;
+                    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+                    if (GetThreadContext(h, &c)) { hist[{ name, c.Rip }]++; total[name]++; }
+                    ResumeThread(h);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            KLOG("profil : %.1f img/s", double(g_presentCount - frames0) / seconds);
+            FILE* f = fopen("build/profile.txt", "w");
+            for (auto& [k, n] : hist)
+            {
+                HMODULE mod = nullptr; char path[MAX_PATH] = "?";
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)k.second, &mod);
+                if (mod) GetModuleFileNameA(mod, path, MAX_PATH);
+                const char* file = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+                fprintf(f, "%s|%s|%llX|%u\n", k.first.c_str(), file, (unsigned long long)(k.second - (uint64_t)mod), n);
+            }
+            fclose(f);
+            for (auto& [name, n] : total) KLOG("profil %s : %u échantillons", name.c_str(), n);
         }).detach();
     }
 #endif

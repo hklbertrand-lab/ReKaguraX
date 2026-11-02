@@ -16,6 +16,7 @@
 #include <xxhash.h>
 
 VkCommandBuffer VulkanFrameCmd();
+uint32_t VulkanFrameSlot();
 void VulkanImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect);
 VkDevice VulkanDevice();
 uint32_t VulkanFindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags);
@@ -73,7 +74,7 @@ static VkBuffer s_upload;
 static VkDeviceMemory s_uploadMem;
 static uint8_t* s_uploadPtr;
 static VkDeviceAddress s_uploadAddr;
-static VkDeviceSize s_uploadOffset;
+static VkDeviceSize s_uploadOffset, s_uploadBegin, s_uploadEnd;   // moitié du tampon propre à l'image en vol
 
 static bool s_inRenderPass;
 static VkCommandBuffer s_cmd;
@@ -222,7 +223,8 @@ static bool BeginCommands()
     if (!s_frameStarted)
     {
         s_frameStarted = true;
-        s_uploadOffset = 0;
+        s_uploadBegin = s_uploadOffset = VulkanFrameSlot() * (kUploadSize / 2);
+        s_uploadEnd = s_uploadBegin + kUploadSize / 2;
         if (s_presented) { Transition(s_presented->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); s_presented = nullptr; }
         static bool first = true;
         if (first)
@@ -241,7 +243,7 @@ static bool BeginCommands()
 static VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize align = 16)
 {
     s_uploadOffset = (s_uploadOffset + align - 1) & ~(align - 1);
-    if (s_uploadOffset + size > kUploadSize) { KLOG("rendu : tampon d'envoi plein"); s_uploadOffset = 0; }
+    if (s_uploadOffset + size > s_uploadEnd) { KLOG("rendu : tampon d'envoi plein"); s_uploadOffset = s_uploadBegin; }
     VkDeviceSize at = s_uploadOffset;
     if (data) memcpy(s_uploadPtr + at, data, size);
     s_uploadOffset += size;

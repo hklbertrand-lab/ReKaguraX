@@ -3,8 +3,11 @@
 #include "guest.h"
 #include "shaders.h"
 #include "render.h"
+#include <atomic>
 #include <chrono>
+#include <immintrin.h>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -51,6 +54,14 @@ static void MemWrite(uint32_t addr, uint32_t value)
 }
 static uint32_t MemRead(uint32_t addr) { return GpuSwap(__builtin_bswap32(Rd32(Phys(addr & ~3u))), addr & 3); }
 
+// IKARUGA_TIMING : temps d'attente cumulés du thread GPU (µs) : WAIT_REG_MEM, interruptions, fence Vulkan, présentation
+std::atomic<uint64_t> g_gpuWaitUs[4];
+struct WaitTimer
+{
+    int slot; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~WaitTimer() { g_gpuWaitUs[slot] += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(); }
+};
+
 std::recursive_mutex g_interruptMutex;
 std::recursive_mutex& GuestCpuLock(uint32_t cpu);
 bool InterruptsDeliver(uint32_t cpu, uint32_t callback, uint32_t source, uint32_t arg);
@@ -58,6 +69,7 @@ bool InterruptsDeliver(uint32_t cpu, uint32_t callback, uint32_t source, uint32_
 void GpuDispatchInterrupt(uint32_t source, uint32_t cpu)
 {
     if (!s_interruptCallback) return;
+    WaitTimer timer{ 1 };
     std::lock_guard lock(g_interruptMutex);   // le matériel sérialise les interruptions graphiques
     if (InterruptsDeliver(cpu, s_interruptCallback, source, s_interruptCallbackCtx)) return;   // exécutée sur le CPU visé
     std::lock_guard cpuLock(GuestCpuLock(cpu));     // repli : pas pendant une section "EE = 0" de ce CPU
@@ -207,6 +219,24 @@ static void ExecutePacket(Reader& r)
     case 0x3C:   // WAIT_REG_MEM : on attend vraiment (le CPU écrit la valeur attendue)
     {
         uint32_t info = r.Read(), addr = r.Read(), ref = r.Read(), mask = r.Read();
+        WaitTimer timer{ 0 };
+        static bool timing = getenv("IKARUGA_TIMING");
+        struct Stat { uint64_t us = 0, n = 0; uint32_t info, ref, mask; };
+        static std::map<uint32_t, Stat> stats;
+        static auto lastPrint = std::chrono::steady_clock::now();
+        struct Rec { std::map<uint32_t, Stat>& st; uint32_t a, i, rf, m; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            ~Rec() { auto& s = st[a]; s.us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(); s.n++; s.info = i; s.ref = rf; s.mask = m; } };
+        std::optional<Rec> rec;
+        if (timing)
+        {
+            rec.emplace(Rec{ stats, addr, info, ref, mask });
+            if (std::chrono::steady_clock::now() - lastPrint > std::chrono::seconds(5))
+            {
+                lastPrint = std::chrono::steady_clock::now();
+                for (auto& [a, s] : stats) KLOG("WAIT_REG_MEM %08X info=%X ref=%08X mask=%08X : %llu fois, %llu ms", a, s.info, s.ref, s.mask, (unsigned long long)s.n, (unsigned long long)s.us / 1000);
+                stats.clear();
+            }
+        }
         for (int spins = 0;; spins++)
         {
             if (!(info & 0x10) && (addr & 0x7FFF) == REG_COHER_STATUS_HOST)
@@ -214,7 +244,7 @@ static void ExecutePacket(Reader& r)
             uint32_t v = (info & 0x10) ? MemRead(addr) : s_regs[addr & 0x7FFF];
             if (Compare(info, v & mask, ref)) break;
             if (spins > 2000000) { KLOG("GPU : WAIT_REG_MEM bloqué info=%X addr=%08X (%08X & %08X vs %08X)", info, addr, v, mask, ref); break; }
-            std::this_thread::yield();
+            if (spins < 20000) _mm_pause(); else std::this_thread::yield();
         }
         break;
     }
@@ -363,14 +393,25 @@ static void ExecuteIndirect(uint32_t addr, uint32_t sizeDwords)
 
 void DebugRegisterThread(const char* name);
 
+// Attente du thread GPU : sous Windows un sleep_for de 100 µs dure 1 à 15 ms, et le CPU attend le GPU à chaque
+// image ; on tourne d'abord activement (~2 ms) avant de céder la main.
+static void GpuIdle(uint32_t& idleSpins)
+{
+    if (++idleSpins < 20000) { _mm_pause(); return; }
+    if (idleSpins < 40000) { std::this_thread::yield(); return; }
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+}
+
 static void GpuThread()
 {
     DebugRegisterThread("gpu");
     GuestInitThreadContext(s_ctx, 0x10000);
+    uint32_t idleSpins = 0;
     for (;;)
     {
         uint32_t wptr = Rd32(MMIO_BASE + REG_CP_RB_WPTR * 4);
-        if (!s_ringBase || wptr == s_rptr) { std::this_thread::sleep_for(std::chrono::microseconds(100)); continue; }
+        if (!s_ringBase || wptr == s_rptr) { GpuIdle(idleSpins); continue; }
+        idleSpins = 0;
         // N'exécute que des paquets entièrement publiés : un paquet qui dépasse wptr attend la suite
         // (sinon la lecture saute par-dessus wptr et refait tout le tour du ring)
         uint32_t size = s_ringSize / 4;
@@ -401,7 +442,7 @@ static void GpuThread()
         s_rptr = r.pos;
         g_gpuRptr = s_rptr; g_gpuLastWptr = wptr;
         if (s_rptrWriteBack) Wr32(s_rptrWriteBack, s_rptr);
-        if (r.pos != wptr) std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (r.pos != wptr) GpuIdle(idleSpins);
     }
 }
 
