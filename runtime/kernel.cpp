@@ -697,13 +697,10 @@ KFUNC(VdSetGraphicsInterruptCallback)
 static std::atomic<uint64_t> s_frames;
 KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; des NOP suffisent sans GPU
 {
-    for (uint32_t i = 0; i < 64; i++) Wr32(ARG(3) + i * 4, 0x80000000);   // paquets type 2 (NOP)
+    // Paquet type 3 opcode 0x64 couvrant les 64 dwords : le thread GPU présentera à ce point du flux
+    Wr32(ARG(3), 0xC0000000 | (62u << 16) | (0x64u << 8));
+    for (uint32_t i = 1; i < 64; i++) Wr32(ARG(3) + i * 4, 0);
     GpuOnSwap();
-    {
-        // Pas encore de rendu : couleur qui pulse pour prouver que chaque VdSwap arrive à l'écran
-        float t = float(s_frames % 120) / 120.0f;
-        VulkanPresent(0.1f, 0.1f + 0.3f * (t < 0.5f ? t * 2 : 2 - t * 2), 0.3f);
-    }
     if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());
     RET(0);

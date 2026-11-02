@@ -2,11 +2,13 @@
 // Pas encore de rendu : les dessins sont ignorés. Sémantique des paquets reprise de Xenia (command_processor.cc).
 #include "guest.h"
 #include "shaders.h"
+#include "render.h"
 #include <chrono>
 #include <map>
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 static uint32_t s_regs[0x8000];
 static uint32_t s_ringBase, s_ringSize, s_rptr, s_rptrWriteBack;
@@ -235,10 +237,21 @@ static void ExecutePacket(Reader& r)
         break;
     }
     case 0x22:   // DRAW_INDX : (viz query, initiateur, ...)
-        r.Read(); RecordDraw(r.Read());
+    {
+        r.Read(); uint32_t initiator = r.Read();
+        RecordDraw(initiator);
+        RenderDraw(s_regs, initiator, Phys);
         break;
+    }
     case 0x36:   // DRAW_INDX_2 : (initiateur, données inline)
-        RecordDraw(r.Read());
+    {
+        uint32_t initiator = r.Read();
+        RecordDraw(initiator);
+        RenderDraw(s_regs, initiator, Phys);
+        break;
+    }
+    case 0x64:   // présentation (paquet écrit par notre VdSwap, comme PM4_XE_SWAP de Xenia)
+        RenderPresent();
         break;
     case 0x2D:   // SET_CONSTANT : écrit une suite de registres (ALU, fetch, bool, loop, registres)
     {
@@ -261,6 +274,7 @@ static void ExecutePacket(Reader& r)
         uint32_t addrType = r.Read(), size = r.Read() & 0xFFFF;
         uint64_t h = HashGuest(Phys(addrType & ~3u), size * 4);
         const TranslatedShader* shader = ShaderLookup(g_base + Phys(addrType & ~3u), size * 4, (addrType & 3) == 1);
+        RenderSetShader((addrType & 3) == 1, g_base + Phys(addrType & ~3u), size * 4, shader);
         if (shader && s_stats.shaders[(addrType & 3) == 1].count(h) == 0 && getenv("IKARUGA_GPUSTATS"))
             KLOG("  -> shader traduit %016llx (%zu mots SPIR-V)", (unsigned long long)shader->containerHash, shader->spirv.size());
         if (s_stats.shaders[(addrType & 3) == 1].insert(h).second && getenv("IKARUGA_GPUSTATS"))
@@ -276,6 +290,12 @@ static void ExecutePacket(Reader& r)
     {
         uint32_t type = r.Read() & 3, size = r.Read() & 0xFFFF;
         uint32_t pos = r.pos;
+        {
+            std::vector<uint8_t> ucode(size * 4);
+            for (uint32_t i = 0; i < size; i++) { uint32_t v = __builtin_bswap32(r.Read()); memcpy(&ucode[i * 4], &v, 4); }
+            r.pos = pos;
+            RenderSetShader(type == 1, ucode.data(), size * 4, ShaderLookup(ucode.data(), size * 4, type == 1));
+        }
         uint64_t h = 1469598103934665603ull;
         for (uint32_t i = 0; i < size; i++) h = (h ^ r.Read()) * 1099511628211ull;
         s_stats.shaders[type == 1].insert(h);

@@ -1,8 +1,22 @@
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index d015145..1728091 100644
+index d015145..604392e 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
-@@ -134,7 +134,13 @@ int main(int argc, char** argv)
+@@ -125,6 +125,13 @@ int main(int argc, char** argv)
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
+ 
++                // Ikaruga : garde le HLSL à côté du cache pour l'inspection (<hash>.hlsl)
++                if (FILE* hlsl = fopen(fmt::format("{}/../hlsl/{:016X}.hlsl", output, hashShaderPair.first).c_str(), "wb"))
++                {
++                    fwrite(recompiler.out.data(), 1, recompiler.out.size(), hlsl);
++                    fclose(hlsl);
++                }
++
+                 thread_local DxcCompiler dxcCompiler;
+ 
+ #ifdef XENOS_RECOMP_DXIL
+@@ -134,7 +141,13 @@ int main(int argc, char** argv)
  #endif
  
                  IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);

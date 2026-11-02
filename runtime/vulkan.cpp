@@ -138,7 +138,22 @@ bool VulkanInit(SDL_Window* window)
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
     const char* devExts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    // Requis par le SPIR-V de XenosRecomp : adresses de buffers en push constants (uint64),
+    // tableaux de descripteurs "bindless" indexés dynamiquement
+    VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    f12.bufferDeviceAddress = VK_TRUE;
+    f12.descriptorIndexing = VK_TRUE;
+    f12.runtimeDescriptorArray = VK_TRUE;
+    f12.descriptorBindingPartiallyBound = VK_TRUE;
+    f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    f12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    f2.pNext = &f12;
+    f2.features.shaderInt64 = VK_TRUE;
+    f2.features.samplerAnisotropy = VK_TRUE;
     VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = 1;
@@ -179,26 +194,83 @@ static void Barrier(VkImage image, VkImageLayout from, VkImageLayout to)
     vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
-// Présente une image : pour l'instant un simple remplissage de couleur (prouve la chaîne swapchain)
-void VulkanPresent(float r, float g, float b)
+static bool s_recording;
+
+// Command buffer de l'image en cours (enregistré par le thread GPU entre deux présentations)
+VkCommandBuffer VulkanFrameCmd()
+{
+    if (!s_recording)
+    {
+        vkWaitForFences(s_device, 1, &s_fence, VK_TRUE, UINT64_MAX);
+        vkResetCommandBuffer(s_cmd, 0);
+        VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(s_cmd, &begin);
+        s_recording = true;
+    }
+    return s_cmd;
+}
+
+void VulkanImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkImageAspectFlags aspect)
+{
+    VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = { aspect, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+VkDevice VulkanDevice() { return s_device; }
+VkPhysicalDevice VulkanPhysicalDevice() { return s_physical; }
+uint32_t VulkanFindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags) { return FindMemoryType(bits, flags); }
+
+// Termine l'image : copie (mise à l'échelle) de src vers la swapchain, soumission et présentation.
+// src en VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ; sans src, image noire.
+void VulkanPresentFrame(VkImage src, uint32_t width, uint32_t height)
 {
     std::lock_guard lock(s_mutex);
     if (!s_device || !s_swapchain) return;
-    vkWaitForFences(s_device, 1, &s_fence, VK_TRUE, UINT64_MAX);
+    VulkanFrameCmd();
 
     uint32_t index;
     VkResult res = vkAcquireNextImageKHR(s_device, s_swapchain, UINT64_MAX, s_acquired, VK_NULL_HANDLE, &index);
-    if (res == VK_ERROR_OUT_OF_DATE_KHR) { vkDeviceWaitIdle(s_device); CreateSwapchain(); return; }
+    if (res == VK_ERROR_OUT_OF_DATE_KHR)
+    {
+        // Image perdue : on soumet quand même le travail enregistré, sans présenter
+        vkEndCommandBuffer(s_cmd);
+        VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &s_cmd;
+        vkResetFences(s_device, 1, &s_fence);
+        vkQueueSubmit(s_queue, 1, &submit, s_fence);
+        s_recording = false;
+        vkDeviceWaitIdle(s_device); CreateSwapchain();
+        return;
+    }
     vkResetFences(s_device, 1, &s_fence);
 
-    vkResetCommandBuffer(s_cmd, 0);
-    VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s_cmd, &begin);
     Barrier(s_images[index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue color{ { r, g, b, 1.0f } };
     VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCmdClearColorImage(s_cmd, s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+    VkClearColorValue black{};
+    vkCmdClearColorImage(s_cmd, s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    if (src)
+    {
+        // Conserve le rapport d'aspect de l'image du jeu
+        float scale = std::min(float(s_extent.width) / width, float(s_extent.height) / height);
+        int32_t w = int32_t(width * scale), h = int32_t(height * scale);
+        int32_t x = (int32_t(s_extent.width) - w) / 2, y = (int32_t(s_extent.height) - h) / 2;
+        VkImageBlit blit{};
+        blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.srcOffsets[1] = { int32_t(width), int32_t(height), 1 };
+        blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blit.dstOffsets[0] = { x, y, 0 };
+        blit.dstOffsets[1] = { x + w, y + h, 1 };
+        vkCmdBlitImage(s_cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
     static uint64_t shotFrame = getenv("IKARUGA_SHOT") ? strtoull(getenv("IKARUGA_SHOT"), nullptr, 10) : 0;
     VkBuffer shotBuf = VK_NULL_HANDLE; VkDeviceMemory shotMem = VK_NULL_HANDLE;
     bool shot = shotFrame && ++s_frame == shotFrame;
@@ -224,6 +296,7 @@ void VulkanPresent(float r, float g, float b)
     else
         Barrier(s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(s_cmd);
+    s_recording = false;
 
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };

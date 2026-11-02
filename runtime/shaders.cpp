@@ -3,6 +3,8 @@
 // on hache donc le microcode en masquant ces instructions, des deux côtés.
 #include "shaders.h"
 #include "guest.h"
+#include <algorithm>
+#include <algorithm>
 #include <unordered_map>
 #include <zstd.h>
 #include <smolv.h>
@@ -23,15 +25,11 @@ static std::mutex s_mutex;
 
 static uint32_t Be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
-// Hachage du microcode en ignorant les instructions de fetch de sommets (patchées par D3D).
-// Flot de contrôle Xenos : paires d'instructions sur 3 dwords ; une exec donne adresse, nombre
-// d'instructions et 2 bits de séquence par instruction (bit 0 = fetch). Instructions de 3 dwords.
-static uint64_t MaskedHash(const uint8_t* ucode, uint32_t sizeBytes)
+// Parcourt le flot de contrôle Xenos : paires d'instructions sur 3 dwords ; une exec donne adresse,
+// nombre d'instructions et 2 bits de séquence par instruction (bit 0 = fetch). Instructions de 3 dwords.
+template<typename F> static void WalkFetches(const std::vector<uint32_t>& w, F&& onFetch)
 {
-    uint32_t dwords = sizeBytes / 4;
-    std::vector<uint32_t> w(dwords);
-    for (uint32_t i = 0; i < dwords; i++) w[i] = Be32(ucode + i * 4);
-
+    uint32_t dwords = uint32_t(w.size());
     uint32_t firstInstr = dwords;   // le flot de contrôle s'arrête là où commencent les instructions
     for (uint32_t cf = 0; cf * 3 + 2 < dwords && cf * 3 < firstInstr; cf++)
     {
@@ -47,14 +45,45 @@ static uint64_t MaskedHash(const uint8_t* ucode, uint32_t sizeBytes)
             for (uint32_t i = 0; i < count; i++)
             {
                 uint32_t at = (address + i) * 3;
-                bool fetch = (sequence >> (i * 2)) & 1;
-                if (fetch && at + 2 < dwords && (w[at] & 0x1F) == 0)   // vfetch : on masque tout sauf l'opcode
-                    w[at] &= 0x1F, w[at + 1] = 0, w[at + 2] = 0;
+                if (((sequence >> (i * 2)) & 1) && at + 2 < dwords && (w[at] & 0x1F) == 0)
+                    onFetch(address + i, at);
             }
         }
     }
+}
+
+static std::vector<uint32_t> LoadWords(const uint8_t* ucode, uint32_t sizeBytes)
+{
+    std::vector<uint32_t> w(sizeBytes / 4);
+    for (size_t i = 0; i < w.size(); i++) w[i] = Be32(ucode + i * 4);
+    return w;
+}
+
+// Hachage du microcode en ignorant les instructions vfetch (patchées par D3D) : on garde l'opcode seul
+static uint64_t MaskedHash(const uint8_t* ucode, uint32_t sizeBytes)
+{
+    std::vector<uint32_t> w = LoadWords(ucode, sizeBytes);
+    WalkFetches(w, [&](uint32_t, uint32_t at) { w[at] &= 0x1F; w[at + 1] = 0; w[at + 2] = 0; });
     return XXH3_64bits(w.data(), w.size() * 4);
 }
+
+void ForEachVertexFetchRaw(const uint8_t* ucode, uint32_t sizeBytes, void (*cb)(void*, uint32_t, const uint32_t*), void* user)
+{
+    std::vector<uint32_t> w = LoadWords(ucode, sizeBytes);
+    WalkFetches(w, [&](uint32_t address, uint32_t at) { cb(user, address, &w[at]); });
+}
+
+// Emplacements fixes des entrées de sommets dans le SPIR-V (copie de USAGE_LOCATIONS de XenosRecomp)
+static int UsageLocation(uint32_t usage, uint32_t index)
+{
+    static const struct { uint32_t usage, index, location; } table[] = {
+        { 0, 0, 0 }, { 3, 0, 1 }, { 6, 0, 2 }, { 7, 0, 3 }, { 5, 0, 4 }, { 5, 1, 5 }, { 5, 2, 6 }, { 5, 3, 7 },
+        { 10, 0, 8 }, { 2, 0, 9 }, { 1, 0, 10 }, { 10, 1, 11 }, { 5, 4, 12 }, { 5, 5, 13 }, { 5, 6, 14 }, { 5, 7, 15 }, { 0, 1, 15 } };
+    for (auto& t : table) if (t.usage == usage && t.index == index) return int(t.location);
+    return -1;
+}
+
+static std::unordered_map<uint64_t, const uint8_t*> s_containers;   // hachage du conteneur -> conteneur dans l'image
 
 void ShadersInit(uint32_t imageBase, uint32_t imageSize)
 {
@@ -74,6 +103,7 @@ void ShadersInit(uint32_t imageBase, uint32_t imageSize)
         uint64_t containerHash = XXH3_64bits(c, size_t(vs) + ps);
         uint32_t po = Be32(c + so), size = Be32(c + so + 4);
         s_byUcode[MaskedHash(c + vs + po, size)] = containerHash;
+        s_containers[containerHash] = c;
         found++;
         if (auto it = s_byContainer.find(containerHash); it != s_byContainer.end() && it->second->spirvSize) translated++;
         i += vs + ps - 4;
@@ -95,6 +125,20 @@ const TranslatedShader* ShaderLookup(const uint8_t* ucode, uint32_t sizeBytes, b
 
     t.containerHash = u->second;
     t.specConstantsMask = e->second->specConstantsMask;
+    t.pixel = pixel;
+    if (!pixel)
+    {
+        // Déclaration de sommets du conteneur : Shader (6 dwords), field18, count, field20, éléments[field18 + i]
+        const uint8_t* c = s_containers[u->second];
+        const uint8_t* sh = c + Be32(c + 24);
+        uint32_t field18 = Be32(sh + 24), count = Be32(sh + 28);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t el = Be32(sh + 36 + (field18 + i) * 4);
+            int loc = UsageLocation((el >> 12) & 0xF, (el >> 16) & 0xF);
+            if (loc >= 0) t.fetchLocations.push_back({ el & 0xFFF, uint32_t(loc) });
+        }
+    }
     const uint8_t* smol = s_spirvBlob.data() + e->second->spirvOffset;
     size_t outSize = smolv::GetDecodedBufferSize(smol, e->second->spirvSize);
     t.spirv.resize(outSize / 4);
