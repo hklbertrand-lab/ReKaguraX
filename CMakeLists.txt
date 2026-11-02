@@ -22,15 +22,28 @@ find_package(SDL3 REQUIRED CONFIG)
 file(GLOB PPC_SOURCES ${CMAKE_SOURCE_DIR}/ppc/*.cpp)
 file(GLOB RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/*.cpp)
 
-add_executable(ikaruga ${RUNTIME_SOURCES} ${PPC_SOURCES} ${CMAKE_SOURCE_DIR}/thirdparty/volk/volk.c)
+# zstd + smol-v (fournis avec XenosRecomp) pour décompresser le cache SPIR-V
+set(XENOS_THIRDPARTY ${CMAKE_SOURCE_DIR}/thirdparty/XenosRecomp/thirdparty)
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${XENOS_THIRDPARTY}/zstd/build/cmake ${CMAKE_BINARY_DIR}/zstd EXCLUDE_FROM_ALL)
+
+add_executable(ikaruga ${RUNTIME_SOURCES} ${PPC_SOURCES}
+    ${CMAKE_SOURCE_DIR}/thirdparty/volk/volk.c
+    ${CMAKE_SOURCE_DIR}/build/shaders/shader_cache.cpp
+    ${XENOS_THIRDPARTY}/smol-v/source/smolv.cpp)
 target_include_directories(ikaruga PRIVATE
     ${CMAKE_SOURCE_DIR}/ppc
     ${CMAKE_SOURCE_DIR}/runtime
     ${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp/thirdparty/simde
     ${CMAKE_SOURCE_DIR}/thirdparty/volk
-    ${CMAKE_SOURCE_DIR}/thirdparty/Vulkan-Headers/include)
+    ${CMAKE_SOURCE_DIR}/thirdparty/Vulkan-Headers/include
+    ${XENOS_THIRDPARTY}/smol-v/source
+    ${XENOS_THIRDPARTY}/xxHash
+    ${XENOS_THIRDPARTY}/zstd/lib)
 target_compile_definitions(ikaruga PRIVATE VK_NO_PROTOTYPES)
-target_link_libraries(ikaruga PRIVATE XenonUtils SDL3::SDL3)
+target_link_libraries(ikaruga PRIVATE XenonUtils SDL3::SDL3 libzstd_static)
 target_compile_options(ikaruga PRIVATE -march=x86-64-v3 -Wno-unused-label -Wno-unused-variable)
 set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
 

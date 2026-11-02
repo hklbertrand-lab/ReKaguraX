@@ -1,6 +1,7 @@
 // Processeur de commandes GPU Xenos (PM4) minimal : registres, écritures mémoire, fences, interruptions.
 // Pas encore de rendu : les dessins sont ignorés. Sémantique des paquets reprise de Xenia (command_processor.cc).
 #include "guest.h"
+#include "shaders.h"
 #include <chrono>
 #include <map>
 #include <set>
@@ -258,7 +259,17 @@ static void ExecutePacket(Reader& r)
     case 0x27:   // IM_LOAD : shader en mémoire (adresse | type, début << 16 | taille)
     {
         uint32_t addrType = r.Read(), size = r.Read() & 0xFFFF;
-        s_stats.shaders[(addrType & 3) == 1].insert(HashGuest(Phys(addrType & ~3u), size * 4));
+        uint64_t h = HashGuest(Phys(addrType & ~3u), size * 4);
+        const TranslatedShader* shader = ShaderLookup(g_base + Phys(addrType & ~3u), size * 4, (addrType & 3) == 1);
+        if (shader && s_stats.shaders[(addrType & 3) == 1].count(h) == 0 && getenv("IKARUGA_GPUSTATS"))
+            KLOG("  -> shader traduit %016llx (%zu mots SPIR-V)", (unsigned long long)shader->containerHash, shader->spirv.size());
+        if (s_stats.shaders[(addrType & 3) == 1].insert(h).second && getenv("IKARUGA_GPUSTATS"))
+        {
+            KLOG("IM_LOAD type=%u taille=%u fnv=%016llx", addrType & 3, size * 4, (unsigned long long)h);
+            std::string hex;
+            for (uint32_t i = 0; i < size; i++) { char b[10]; snprintf(b, sizeof b, "%08x ", Rd32(Phys(addrType & ~3u) + i * 4)); hex += b; }
+            KLOG("  ucode %s", hex.c_str());
+        }
         break;
     }
     case 0x2B:   // IM_LOAD_IMMEDIATE : shader inline

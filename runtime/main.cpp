@@ -1,6 +1,7 @@
 // Ikaruga recompilé : point d'entrée, mémoire invitée, chargement du XEX, fenêtre SDL3
 #include "guest.h"
 #include "vulkan.h"
+#include "shaders.h"
 #include <image.h>
 #include <xex.h>
 #include <string>
@@ -124,6 +125,7 @@ static bool LoadExecutable()
     Image img = Image::ParseImage(data.data(), data.size());
     memcpy(g_base + img.base, img.data.get(), img.size);
     PatchDataImports(data.data());
+    ShadersInit(PPC_IMAGE_BASE, PPC_IMAGE_SIZE);
 
     // Table de pointeurs de fonctions juste après l'image, comme l'attend PPC_LOOKUP_FUNC
     for (PPCFuncMapping* m = PPCFuncMappings; m->host; m++)
