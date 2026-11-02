@@ -78,8 +78,8 @@ PPC_FUNC(sub_821600C8)
         for (uint32_t w : { 0x40004F5Cu, 0x40004FACu })
         {
             uint32_t sh = Rd32(w);
-            KLOG("  travailleur %08X cpu=%u file=%u/%u | partagé %08X verrou=%u masque=%08X compteur=%u +44=%u", w, Rd32(w + 4), Rd32(w + 60), Rd32(w + 56),
-                sh, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), Rd32(sh + 44));
+            KLOG("  travailleur %08X cpu=%u file=%u/%u | partagé %08X verrou=%u masque=%08X compteur=%u +44=%u +96=%u +100=%u +24=%u +28=%u +32=%08X +36=%08X", w, Rd32(w + 4), Rd32(w + 60), Rd32(w + 56),
+                sh, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), Rd32(sh + 44), Rd32(sh + 96), Rd32(sh + 100), Rd32(sh + 24), Rd32(sh + 28), Rd32(sh + 32), Rd32(sh + 36));
         }
     }
     __imp__sub_821600C8(ctx, base);

@@ -16,6 +16,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 uint8_t* g_base;
@@ -63,13 +64,42 @@ void GuestInitThreadContext(PPCContext& ctx, uint32_t stackSize)
     ctx.msr = 0x8000;   // interruptions autorisées (EE)
 }
 
+// Mémoire invitée (4 Go). La mémoire physique (512 Mo) est visible à 0xA0000000 et 0xC0000000 :
+// ces deux plages sont deux vues d'une même section (le jeu et D3D passent de l'une à l'autre).
+// La vue 0xE0000000 (décalée de 4 Ko chez Xenia) reste indépendante pour l'instant.
+static constexpr uint64_t kPhysicalSize = 0x20000000;
+
 static bool ReserveGuestMemory()
 {
 #ifdef _WIN32
-    g_base = (uint8_t*)VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(kPhysicalSize), nullptr);
+    if (!section) return false;
+    for (int attempt = 0; attempt < 8 && !g_base; attempt++)
+    {
+        // Trouve 4 Go libres, les libère, puis y place les morceaux à adresses fixes
+        uint8_t* p = (uint8_t*)VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_RESERVE, PAGE_NOACCESS);
+        if (!p) return false;
+        VirtualFree(p, 0, MEM_RELEASE);
+        bool ok = VirtualAlloc(p, 0xA0000000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) &&
+            MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, p + 0xA0000000) &&
+            MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, p + 0xC0000000) &&
+            VirtualAlloc(p + 0xE0000000, 0x20000000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (ok) g_base = p;
+        else
+        {
+            VirtualFree(p, 0, MEM_RELEASE);
+            UnmapViewOfFile(p + 0xA0000000);
+            UnmapViewOfFile(p + 0xC0000000);
+            VirtualFree(p + 0xE0000000, 0, MEM_RELEASE);
+        }
+    }
 #else
+    int fd = memfd_create("ikaruga-physique", 0);
+    if (fd < 0 || ftruncate(fd, kPhysicalSize) != 0) return false;
     g_base = (uint8_t*)mmap(nullptr, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (g_base == MAP_FAILED) g_base = nullptr;
+    if (g_base == MAP_FAILED) return g_base = nullptr, false;
+    for (uint64_t view : { 0xA0000000ull, 0xC0000000ull })
+        if (mmap(g_base + view, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) return false;
 #endif
     return g_base != nullptr;
 }
