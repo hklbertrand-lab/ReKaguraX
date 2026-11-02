@@ -74,6 +74,8 @@ static VkBuffer s_upload;
 static VkDeviceMemory s_uploadMem;
 static uint8_t* s_uploadPtr;
 static VkDeviceAddress s_uploadAddr;
+static uint64_t s_frameId;
+uint32_t g_statPipelines, g_statTextures, g_statTextureKb;   // créations de l'image en cours (IKARUGA_TIMING)   // incrémenté à chaque image enregistrée
 static VkDeviceSize s_uploadOffset, s_uploadBegin, s_uploadEnd;   // moitié du tampon propre à l'image en vol
 
 static bool s_inRenderPass;
@@ -223,6 +225,7 @@ static bool BeginCommands()
     if (!s_frameStarted)
     {
         s_frameStarted = true;
+        s_frameId++;
         s_uploadBegin = s_uploadOffset = VulkanFrameSlot() * (kUploadSize / 2);
         s_uploadEnd = s_uploadBegin + kUploadSize / 2;
         if (s_presented) { Transition(s_presented->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); s_presented = nullptr; }
@@ -248,6 +251,21 @@ static VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize ali
     if (data) memcpy(s_uploadPtr + at, data, size);
     s_uploadOffset += size;
     return at;
+}
+
+// Constantes : la plupart des dessins consécutifs gardent les mêmes ; on réutilise alors la copie précédente
+// de l'image en cours au lieu de réécrire ~9 Ko par dessin dans la mémoire partagée avec la carte
+static VkDeviceSize UploadConstants(int slot, const void* data, VkDeviceSize size)
+{
+    static std::vector<uint8_t> last[3];
+    static VkDeviceSize lastAt[3];
+    static uint64_t lastFrame[3];
+    auto& l = last[slot];
+    if (lastFrame[slot] == s_frameId && l.size() == size && !memcmp(l.data(), data, size))
+        return lastAt[slot];
+    l.assign((const uint8_t*)data, (const uint8_t*)data + size);
+    lastFrame[slot] = s_frameId;
+    return lastAt[slot] = Upload(data, size, 256);
 }
 
 static void EndRenderPass()
@@ -539,6 +557,7 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     pci.layout = s_pipelineLayout;
     pci.renderPass = RenderPassFor(format);
     VkPipeline pipeline = VK_NULL_HANDLE;
+    g_statPipelines++;
     VkResult r = vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline);
     if (r != VK_SUCCESS) KLOG("rendu : échec de création du pipeline (%d)", r);
     s_pipelines[h] = pipeline;
@@ -730,6 +749,7 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
 
     // Dé-tuilage + remise en ordre des octets dans le tampon d'envoi
     EndRenderPass();
+    g_statTextures++; g_statTextureKb += srcSize >> 10;
     uint32_t rowBytes = bw * info.bytesPerBlock;
     VkDeviceSize at = Upload(nullptr, VkDeviceSize(rowBytes) * bh, 16);
     uint8_t* dst = s_uploadPtr + at;
@@ -774,7 +794,8 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
         VkDescriptorImageInfo ii{ VK_NULL_HANDLE, t.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, t.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
         vkUpdateDescriptorSets(s_dev, 1, &w, 0, nullptr);
-        if (getenv("IKARUGA_DRAWLOG"))
+        static const bool drawLog = getenv("IKARUGA_DRAWLOG");
+        if (drawLog)
             KLOG("texture %ux%u format %u %s swizzle %03X -> descripteur %u", width, height, format, tiled ? "tuilée" : "linéaire", sw, t.descriptor);
     }
     t.contentHash = content;
@@ -840,7 +861,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         if (prim == 8) { static int warned; if (!warned++) KLOG("rendu : rectangles indexés non gérés"); return; }
     }
 
-    VertexLayout layout;
+    VertexLayout layout{};   // zéro : la clé des pipelines hache aussi les entrées inutilisées
     if (!DecodeVertexLayout(regs, layout)) return;
 
     VkPrimitiveTopology topology;
@@ -913,14 +934,15 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     }
 
     // Constantes : VS = registres ALU 0-255, PS = 256-479 (float4, valeurs déjà en ordre hôte)
-    if (getenv("IKARUGA_FADELOG") && s_ps->containerHash == 0xd721fb273c54220aull)
+    static const bool fadeLog = getenv("IKARUGA_FADELOG");
+    if (fadeLog && s_ps->containerHash == 0xd721fb273c54220aull)
     {
         static int n;
         float c[4]; memcpy(c, regs + ALU_CONSTANTS + 256 * 4, 16);
         if (n++ % 60 == 0) KLOG("remplissage g_vMCol = %.3f %.3f %.3f %.3f, blend %08X", c[0], c[1], c[2], c[3], regs[RB_BLENDCONTROL0]);
     }
-    VkDeviceSize vsConst = Upload(regs + ALU_CONSTANTS, 4096, 256);
-    VkDeviceSize psConst = Upload(regs + ALU_CONSTANTS + 256 * 4, 3584, 256);
+    VkDeviceSize vsConst = UploadConstants(0, regs + ALU_CONSTANTS, 4096);
+    VkDeviceSize psConst = UploadConstants(1, regs + ALU_CONSTANTS + 256 * 4, 3584);
     uint8_t shared[1024]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha, boucles
     // Textures du pixel shader : l'échantillonneur n lit la fetch constant n ; indices 2D en c0-c3, samplers en c12-c15
     for (uint32_t slot = 0; slot < 16; slot++)
@@ -941,7 +963,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         int32_t loop[4] = { int32_t(v & 0xFF), int32_t((v >> 8) & 0xFF), int32_t(int8_t((v >> 16) & 0xFF)), 0 };
         memcpy(shared + 512 + n * 16, loop, 16);
     }
-    VkDeviceSize sharedConst = Upload(shared, sizeof(shared), 256);
+    VkDeviceSize sharedConst = UploadConstants(2, shared, sizeof(shared));
     uint64_t push[3] = { s_uploadAddr + vsConst, s_uploadAddr + psConst, s_uploadAddr + sharedConst };
 
     uint32_t colorControl = regs[RB_COLORCONTROL];

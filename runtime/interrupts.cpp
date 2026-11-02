@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <thread>
 #include <vector>
 
 void KernelWakeWaiters();
@@ -38,8 +39,17 @@ void InterruptsRegisterThread(PPCContext& ctx)
 PPCContext* InterruptsCurrentContext() { return t_ctx; }
 uint32_t InterruptsCurrentCpu() { return t_ctx ? CpuOf(*t_ctx) : 99; }
 
+// db16cyc (indice "boucle d'attente" du PowerPC) : les attentes actives du jeu cèdent régulièrement le cœur ;
+// sur une machine à 4 cœurs, elles préemptaient sinon le thread GPU ou celui qui fait le vrai travail
+static void SpinHint()
+{
+    static thread_local uint32_t spins;
+    if ((++spins & 255) == 0) std::this_thread::yield();
+}
+
 void GuestPollInterrupts(PPCContext& ctx)
 {
+    SpinHint();
     if (t_inInterrupt || !(ctx.msr & 0x8000)) return;
     uint32_t cpu = CpuOf(ctx);
     if (!s_pending[cpu].load(std::memory_order_relaxed)) return;

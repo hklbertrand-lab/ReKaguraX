@@ -768,7 +768,10 @@ static uint16_t KeyboardButtons()
         if (k[SDL_SCANCODE_V]) b |= 0x8000;
     }
     static const char* autoStart = getenv("IKARUGA_AUTOSTART");
-    if (autoStart)
+    // IKARUGA_AUTOSTOP=n : plus d'appuis automatiques après l'image n (mesures en jeu sans menu pause)
+    static const uint64_t autoStop = getenv("IKARUGA_AUTOSTOP") ? strtoull(getenv("IKARUGA_AUTOSTOP"), nullptr, 10) : ~0ull;
+    extern uint64_t g_presentCount;
+    if (autoStart && g_presentCount < autoStop)
     {
         static uint32_t calls;
         uint32_t period = std::max(1, atoi(autoStart)) * 4;
@@ -958,6 +961,14 @@ KFUNC(VdSetGraphicsInterruptCallback)
             {
                 next += std::chrono::microseconds(periodUs);
                 std::this_thread::sleep_until(next);
+                static bool timing = getenv("IKARUGA_TIMING");
+                if (timing)
+                {
+                    static double worst, sum; static int n;
+                    double late = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - next).count();
+                    worst = std::max(worst, late); sum += late;
+                    if (++n == 300) { KLOG("vblank : retard moyen %.2f ms, max %.2f ms", sum / n, worst); worst = sum = 0; n = 0; }
+                }
                 if (uint32_t cb = s_gfxCallback)
                 {
                     std::lock_guard lock(g_interruptMutex);   // sérialisé avec les interruptions du GPU
@@ -985,6 +996,20 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
     if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());
     static bool timing = getenv("IKARUGA_TIMING");
+    if (timing)
+    {
+        // Histogramme des intervalles entre VdSwap (en vblanks de 16,7 ms)
+        static auto prev = std::chrono::steady_clock::now();
+        static uint32_t hist[4];
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - prev).count(); prev = now;
+        hist[std::min(3, int(ms / 16.667 + 0.5) > 0 ? int(ms / 16.667 + 0.5) - 1 : 0)]++;
+        extern uint32_t g_statPipelines, g_statTextures, g_statTextureKb;
+        if (ms > 25 && s_frames > 300)
+            KLOG("à-coup image %llu : %.1f ms (pipelines %u, textures %u / %u Ko)", (unsigned long long)s_frames.load(), ms, g_statPipelines, g_statTextures, g_statTextureKb);
+        g_statPipelines = g_statTextures = g_statTextureKb = 0;
+        if (s_frames % 600 == 0) { KLOG("intervalles VdSwap : 1 vbl %u, 2 vbl %u, 3 vbl %u, plus %u", hist[0], hist[1], hist[2], hist[3]); memset(hist, 0, sizeof(hist)); }
+    }
     if (timing && s_frames % 120 == 0)
     {
         extern std::atomic<uint64_t> g_gpuWaitUs[4];

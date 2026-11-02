@@ -246,6 +246,9 @@ int main(int argc, char** argv)
     if (!LoadExecutable()) { fprintf(stderr, "default.xex introuvable dans %s\n", g_gameDir.string().c_str()); return 1; }
 
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO);
+#ifdef _WIN32
+    timeBeginPeriod(1);   // sommeils à la milliseconde (vblank, attentes) au lieu de 15,6 ms
+#endif
     g_window = SDL_CreateWindow("Ikaruga", 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!VulkanInit(g_window)) fprintf(stderr, "Vulkan indisponible : pas d'affichage\n");
 
@@ -288,7 +291,6 @@ int main(int argc, char** argv)
             extern uint64_t g_presentCount;
             uint64_t frames0 = g_presentCount;
             KLOG("profilage pendant %d s", seconds);
-            timeBeginPeriod(1);
             std::map<std::pair<std::string, uint64_t>, uint32_t> hist;
             std::map<std::string, uint32_t> total;
             auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);

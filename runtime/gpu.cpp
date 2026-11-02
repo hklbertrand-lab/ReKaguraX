@@ -90,7 +90,8 @@ static void WriteRegister(uint32_t index, uint32_t value)
     {
         uint32_t n = index - REG_SCRATCH_REG0;
         static int logged;
-        if (getenv("IKARUGA_IBLOG") && logged++ < 20) KLOG("SCRATCH%u = %08X (UMSK=%08X ADDR=%08X)", n, value, s_regs[REG_SCRATCH_UMSK], s_regs[REG_SCRATCH_ADDR]);
+        static const bool ibLog = getenv("IKARUGA_IBLOG");
+        if (ibLog && logged++ < 20) KLOG("SCRATCH%u = %08X (UMSK=%08X ADDR=%08X)", n, value, s_regs[REG_SCRATCH_UMSK], s_regs[REG_SCRATCH_ADDR]);
         if ((1u << n) & s_regs[REG_SCRATCH_UMSK])
             Wr32(Phys(s_regs[REG_SCRATCH_ADDR] + n * 4), value);
     }
@@ -243,8 +244,11 @@ static void ExecutePacket(Reader& r)
                 s_regs[REG_COHER_STATUS_HOST] &= ~0x80000000u;   // "MakeCoherent" : rien à synchroniser chez nous
             uint32_t v = (info & 0x10) ? MemRead(addr) : s_regs[addr & 0x7FFF];
             if (Compare(info, v & mask, ref)) break;
-            if (spins > 2000000) { KLOG("GPU : WAIT_REG_MEM bloqué info=%X addr=%08X (%08X & %08X vs %08X)", info, addr, v, mask, ref); break; }
-            if (spins < 20000) _mm_pause(); else std::this_thread::yield();
+            if (spins > 200000) { KLOG("GPU : WAIT_REG_MEM bloqué info=%X addr=%08X (%08X & %08X vs %08X)", info, addr, v, mask, ref); break; }
+            // Les longues attentes (flip à la vblank, ~10 ms) dorment : 4 cœurs seulement pour tous les threads
+            if (spins < 2000) _mm_pause();
+            else if (spins < 4000) std::this_thread::yield();
+            else std::this_thread::sleep_for(std::chrono::microseconds(250));
         }
         break;
     }
@@ -285,7 +289,8 @@ static void ExecutePacket(Reader& r)
         uint32_t initiator = r.Read(), addr = r.Read(), value = r.Read();
         MemWrite(addr, (initiator >> 31) ? s_swapCounter : value);
         static auto last = std::chrono::steady_clock::now();
-        if (getenv("IKARUGA_FENCELOG") && std::chrono::steady_clock::now() - last > std::chrono::milliseconds(500))
+        static const bool fenceLog = getenv("IKARUGA_FENCELOG");
+        if (fenceLog && std::chrono::steady_clock::now() - last > std::chrono::milliseconds(500))
         {
             last = std::chrono::steady_clock::now();
             KLOG("EVENT_WRITE_SHD initiateur=%08X adresse=%08X valeur=%08X compteur=%u", initiator, addr, value, s_swapCounter);
@@ -397,8 +402,8 @@ void DebugRegisterThread(const char* name);
 // image ; on tourne d'abord activement (~2 ms) avant de céder la main.
 static void GpuIdle(uint32_t& idleSpins)
 {
-    if (++idleSpins < 20000) { _mm_pause(); return; }
-    if (idleSpins < 40000) { std::this_thread::yield(); return; }
+    if (++idleSpins < 4000) { _mm_pause(); return; }
+    if (idleSpins < 8000) { std::this_thread::yield(); return; }
     std::this_thread::sleep_for(std::chrono::microseconds(100));
 }
 
