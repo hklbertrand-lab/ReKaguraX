@@ -14,6 +14,7 @@
 
 void InterruptsRegisterThread(PPCContext& ctx);
 void InterruptsPollCurrent();
+uint32_t InterruptsCurrentCpu();
 
 #define KFUNC(name) PPC_FUNC(__imp__##name)
 #define ARG(n) ctx.r##n.u32
@@ -259,15 +260,35 @@ static std::recursive_mutex& CriticalSection(uint32_t addr)
 
 KFUNC(RtlInitializeCriticalSection) { CriticalSection(ARG(3)); }
 KFUNC(RtlInitializeCriticalSectionAndSpinCount) { CriticalSection(ARG(3)); RET(STATUS_SUCCESS); }
-KFUNC(RtlEnterCriticalSection) { CriticalSection(ARG(3)).lock(); }
+static void LockLogged(std::recursive_mutex& m, const char* what, uint32_t addr, uint32_t lr);
+KFUNC(RtlEnterCriticalSection) { LockLogged(CriticalSection(ARG(3)), "section critique", ARG(3), uint32_t(ctx.lr)); }
 KFUNC(RtlLeaveCriticalSection) { CriticalSection(ARG(3)).unlock(); }
 KFUNC(RtlTryEnterCriticalSection) { RET(CriticalSection(ARG(3)).try_lock() ? 1 : 0); }
 
-static std::recursive_mutex s_spin;
-KFUNC(KfAcquireSpinLock) { s_spin.lock(); RET(0); }
-KFUNC(KfReleaseSpinLock) { s_spin.unlock(); }
-KFUNC(KeAcquireSpinLockAtRaisedIrql) { s_spin.lock(); }
-KFUNC(KeReleaseSpinLockFromRaisedIrql) { s_spin.unlock(); }
+// Un verrou par spinlock invité (adresse) : un verrou global unique bloquait un thread qui voulait un
+// spinlock pendant qu'un autre thread en tenait un différent (interblocage dans D3D sur l'écran titre)
+static std::recursive_mutex& SpinLock(uint32_t addr) { return CriticalSection(addr); }
+
+// Prise de verrou qui signale les attentes de plus de 2 s (débogage des interblocages)
+static void LockLogged(std::recursive_mutex& m, const char* what, uint32_t addr, uint32_t lr)
+{
+    auto start = std::chrono::steady_clock::now();
+    bool logged = false;
+    while (!m.try_lock())
+    {
+        InterruptsPollCurrent();
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (!logged && std::chrono::steady_clock::now() - start > std::chrono::seconds(2))
+        {
+            logged = true;
+            KLOG("verrou bloqué : %s %08X (appelant %08X, CPU %u)", what, addr, lr, InterruptsCurrentCpu());
+        }
+    }
+}
+KFUNC(KfAcquireSpinLock) { LockLogged(SpinLock(ARG(3)), "spinlock", ARG(3), uint32_t(ctx.lr)); RET(0); }
+KFUNC(KfReleaseSpinLock) { SpinLock(ARG(3)).unlock(); }
+KFUNC(KeAcquireSpinLockAtRaisedIrql) { LockLogged(SpinLock(ARG(3)), "spinlock", ARG(3), uint32_t(ctx.lr)); }
+KFUNC(KeReleaseSpinLockFromRaisedIrql) { SpinLock(ARG(3)).unlock(); }
 KFUNC(KeRaiseIrqlToDpcLevel) { RET(0); }
 KFUNC(KfLowerIrql) {}
 KFUNC(KeEnterCriticalRegion) {}
@@ -325,6 +346,14 @@ KFUNC(KeReleaseSemaphore)   // (sem, increment, adjustment, wait)
 // Attente sans délai : par tranches de 2 s, en signalant les attentes longues (débogage des blocages)
 static bool WaitLogged(KObject& o, int64_t timeoutMs, const char* what, uint32_t id, uint32_t lr)
 {
+    if (getenv("IKARUGA_WAITLOG"))
+    {
+        static std::mutex m; static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last;
+        uint32_t cpu = InterruptsCurrentCpu();
+        std::lock_guard l(m);
+        auto now = std::chrono::steady_clock::now();
+        if (now - last[cpu] > std::chrono::seconds(2)) { last[cpu] = now; KLOG("attente CPU%u : %s %08X délai %lld ms (appelant %08X)", cpu, what, id, (long long)timeoutMs, lr); }
+    }
     if (timeoutMs >= 0) return o.Wait(timeoutMs);
     for (int slices = 0;; slices++)
     {
@@ -491,6 +520,7 @@ KFUNC(KeSetAffinityThread)   // (thread, masque) -> ancien masque
 KFUNC(KeGetCurrentProcessType) { RET(1); }   // processus titre
 KFUNC(KeDelayExecutionThread)   // (mode, alertable, pInterval)
 {
+    if (getenv("IKARUGA_WAITLOG")) { static auto last = std::chrono::steady_clock::now(); if (std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) { last = std::chrono::steady_clock::now(); KLOG("KeDelayExecutionThread CPU%u %lld ms (appelant %08X)", InterruptsCurrentCpu(), (long long)TimeoutMs(ARG(5)), uint32_t(ctx.lr)); } }
     int64_t ms = TimeoutMs(ARG(5));
     if (ms <= 0) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     RET(STATUS_SUCCESS);

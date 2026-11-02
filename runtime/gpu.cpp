@@ -111,6 +111,7 @@ struct Reader
 };
 
 static void ExecuteIndirect(uint32_t addr, uint32_t sizeDwords);
+static uint64_t s_binMask = 0xFFFFFFFFull, s_binSelect = 0xFFFFFFFFull;   // prédication des paquets
 
 // Statistiques (IKARUGA_GPUSTATS=1) pour dimensionner le moteur de rendu
 static struct
@@ -180,6 +181,8 @@ static void ExecutePacket(Reader& r)
     }
 
     uint32_t opcode = (packet >> 8) & 0x7F, count = ((packet >> 16) & 0x3FFF) + 1;
+    // Prédication (bit 0 de l'en-tête) : le paquet ne s'exécute que si BIN_SELECT & BIN_MASK != 0 (Xenia)
+    if ((packet & 1) && (!(s_binSelect & s_binMask) || opcode == 0x64)) { r.Skip(count); return; }
     s_stats.opcodes[opcode]++;
     s_curOpcode = opcode;
     uint32_t end = r.pos;
@@ -288,6 +291,12 @@ static void ExecutePacket(Reader& r)
         RenderDraw(s_regs, initiator, Phys);
         break;
     }
+    case 0x60: s_binMask = (s_binMask & 0xFFFFFFFF00000000ull) | r.Read(); break;                      // SET_BIN_MASK_LO
+    case 0x61: s_binMask = (s_binMask & 0xFFFFFFFFull) | (uint64_t(r.Read()) << 32); break;             // SET_BIN_MASK_HI
+    case 0x62: s_binSelect = (s_binSelect & 0xFFFFFFFF00000000ull) | r.Read(); break;                  // SET_BIN_SELECT_LO
+    case 0x63: s_binSelect = (s_binSelect & 0xFFFFFFFFull) | (uint64_t(r.Read()) << 32); break;         // SET_BIN_SELECT_HI
+    case 0x50: { uint64_t hi = r.Read(); s_binMask = (hi << 32) | r.Read(); break; }                    // SET_BIN_MASK
+    case 0x51: { uint64_t hi = r.Read(); s_binSelect = (hi << 32) | r.Read(); break; }                  // SET_BIN_SELECT
     case 0x64:   // présentation (paquet écrit par notre VdSwap, comme PM4_XE_SWAP de Xenia)
         RenderPresent();
         break;

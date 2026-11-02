@@ -34,6 +34,7 @@ void InterruptsRegisterThread(PPCContext& ctx)
 }
 
 PPCContext* InterruptsCurrentContext() { return t_ctx; }
+uint32_t InterruptsCurrentCpu() { return t_ctx ? CpuOf(*t_ctx) : 99; }
 
 void GuestPollInterrupts(PPCContext& ctx)
 {

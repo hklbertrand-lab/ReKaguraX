@@ -149,3 +149,16 @@ PPC_FUNC(sub_82171348)
     }
     __imp__sub_82171348(ctx, base);
 }
+
+// Callback d'interruption D3D qui dépose une tâche pour le CPU courant : profondeur de file
+extern "C" PPC_FUNC(__imp__sub_82170FB8);
+PPC_FUNC(sub_82170FB8)
+{
+    static bool on = getenv("IKARUGA_QUEUELOG");
+    uint32_t cpu = Rd8(ctx.r13.u32 + 0x10C), q = 0x40004EBC + cpu * 80;
+    static uint32_t maxDepth, calls;
+    uint32_t depth = Rd32(q + 56) - Rd32(q + 60);
+    calls++;
+    if (depth > maxDepth) { maxDepth = depth; if (on) KLOG("file CPU%u : profondeur %u (appel %u, tâche %08X)", cpu, depth, calls, ctx.r3.u32); }
+    __imp__sub_82170FB8(ctx, base);
+}
