@@ -298,7 +298,7 @@ static void ExecutePacket(Reader& r)
     case 0x50: { uint64_t hi = r.Read(); s_binMask = (hi << 32) | r.Read(); break; }                    // SET_BIN_MASK
     case 0x51: { uint64_t hi = r.Read(); s_binSelect = (hi << 32) | r.Read(); break; }                  // SET_BIN_SELECT
     case 0x64:   // présentation (paquet écrit par notre VdSwap, comme PM4_XE_SWAP de Xenia)
-        RenderPresent();
+        RenderPresent(r.Read());   // adresse du tampon d'affichage écrite par VdSwap
         break;
     case 0x2D:   // SET_CONSTANT : écrit une suite de registres (ALU, fetch, bool, loop, registres)
     {

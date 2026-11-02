@@ -968,6 +968,8 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
     // Paquet type 3 opcode 0x64 couvrant les 64 dwords : le thread GPU présentera à ce point du flux
     Wr32(ARG(3), 0xC0000000 | (62u << 16) | (0x64u << 8));
     for (uint32_t i = 1; i < 64; i++) Wr32(ARG(3) + i * 4, 0);
+    // dword 1 : adresse physique du tampon d'affichage (fetch constant de texture passée en r4)
+    if (ARG(4)) Wr32(ARG(3) + 4, ((Rd32(ARG(4) + 4) >> 12) << 12) & 0x1FFFFFFF);
     GpuOnSwap();
     if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());

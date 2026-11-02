@@ -1,11 +1,14 @@
 // Rendu Vulkan des dessins Xenos : état lu dans les registres GPU, shaders traduits par XenosRecomp.
-// EDRAM émulée par une image 1280x720 ; un "resolve" la copie dans l'image du tampon d'affichage.
-// Première version : pas de profondeur, textures remplacées par une texture blanche.
+// EDRAM : une image Vulkan par cible (base, format, pitch) + un tampon de profondeur par taille.
+// Un "resolve" copie la cible dans une image indexée par son adresse de destination ; une texture lue à
+// cette adresse utilise directement cette image (pas de relecture par le CPU), et VdSwap présente celle
+// du tampon d'affichage.
 #include "render.h"
 #include "guest.h"
 #include "shaders.h"
 #include "vulkan.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <unordered_map>
 #include <vector>
@@ -25,19 +28,36 @@ enum : uint32_t
     PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082,
     RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206,
     RB_MODECONTROL = 0x2208, RB_COPY_CONTROL = 0x2318, RB_COLOR_CLEAR = 0x231E,
+    RB_DEPTH_INFO = 0x2002, RB_DEPTHCONTROL = 0x2200, PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114,
+    RB_COPY_DEST_BASE = 0x2319, RB_COPY_DEST_PITCH = 0x231A, RB_DEPTH_CLEAR = 0x231D,
     ALU_CONSTANTS = 0x4000, FETCH_CONSTANTS = 0x4800, BOOL_CONSTANTS = 0x4900,
 };
 
-static constexpr uint32_t kWidth = 1280, kHeight = 720;
+static constexpr uint32_t kTargetHeight = 1024;   // hauteur des cibles (l'EDRAM n'en fixe pas)
 static constexpr VkDeviceSize kUploadSize = 64 << 20;
 
-struct Image { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED; };
+struct Image
+{
+    VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED; VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+};
 
 static bool s_ready;
 static VkDevice s_dev;
-static Image s_edram, s_front, s_white;
-static VkRenderPass s_renderPass;
-static VkFramebuffer s_framebuffer;
+static Image s_white;
+
+struct ColorTarget { Image image; VkFormat format; uint32_t width, height; };
+struct DepthTarget { Image image; uint32_t width, height; };
+struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0; };
+static std::unordered_map<uint64_t, ColorTarget> s_colorTargets;       // (base EDRAM, format, pitch)
+static std::unordered_map<uint64_t, DepthTarget> s_depthTargets;       // (base EDRAM, taille)
+static std::unordered_map<uint32_t, VkRenderPass> s_renderPasses;      // par format couleur (+ profondeur D32S8)
+static std::unordered_map<uint64_t, VkFramebuffer> s_framebuffers;
+static std::unordered_map<uint32_t, Resolved> s_resolved;              // adresse physique de destination -> copie
+static uint32_t s_lastResolved;
+static Resolved* s_presented;                                          // à remettre en lecture après présentation
+static ColorTarget* s_curColor;
+static DepthTarget* s_curDepth;
 static VkDescriptorSetLayout s_setLayouts[4];
 static VkDescriptorPool s_descPool;
 static VkDescriptorSet s_sets[4];
@@ -77,12 +97,14 @@ static VkDeviceMemory Allocate(VkMemoryRequirements req, VkMemoryPropertyFlags f
     return mem;
 }
 
-static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage)
+static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,
+    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT)
 {
     Image img;
+    img.aspect = aspect;
     VkImageCreateInfo ci{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ci.imageType = VK_IMAGE_TYPE_2D;
-    ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ci.format = format;
     ci.extent = { w, h, 1 };
     ci.mipLevels = 1;
     ci.arrayLayers = 1;
@@ -98,7 +120,7 @@ static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage)
     vi.image = img.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vi.format = ci.format;
-    vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vi.subresourceRange = { aspect == VK_IMAGE_ASPECT_COLOR_BIT ? aspect : VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT), 0, 1, 0, 1 };
     vkCreateImageView(s_dev, &vi, nullptr, &img.view);
     return img;
 }
@@ -106,7 +128,7 @@ static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage)
 static void Transition(Image& img, VkImageLayout to)
 {
     if (img.layout == to) return;
-    VulkanImageBarrier(s_cmd, img.image, img.layout, to, VK_IMAGE_ASPECT_COLOR_BIT);
+    VulkanImageBarrier(s_cmd, img.image, img.layout, to, img.aspect);
     img.layout = to;
 }
 
@@ -115,8 +137,6 @@ static bool Init()
     s_dev = VulkanDevice();
     if (!s_dev) return false;
 
-    s_edram = CreateImage(kWidth, kHeight, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    s_front = CreateImage(kWidth, kHeight, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     s_white = CreateImage(1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     // Tampon d'envoi : sommets + constantes, lu par les shaders via son adresse GPU
@@ -133,36 +153,6 @@ static bool Init()
     VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
     ai.buffer = s_upload;
     s_uploadAddr = vkGetBufferDeviceAddress(s_dev, &ai);
-
-    // Passe de rendu : une cible couleur conservée entre les dessins
-    VkAttachmentDescription att{};
-    att.format = VK_FORMAT_R8G8B8A8_UNORM;
-    att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    att.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference ref{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-    VkSubpassDescription sub{};
-    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &ref;
-    VkRenderPassCreateInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-    rp.attachmentCount = 1;
-    rp.pAttachments = &att;
-    rp.subpassCount = 1;
-    rp.pSubpasses = &sub;
-    vkCreateRenderPass(s_dev, &rp, nullptr, &s_renderPass);
-    VkFramebufferCreateInfo fb{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
-    fb.renderPass = s_renderPass;
-    fb.attachmentCount = 1;
-    fb.pAttachments = &s_edram.view;
-    fb.width = kWidth;
-    fb.height = kHeight;
-    fb.layers = 1;
-    vkCreateFramebuffer(s_dev, &fb, nullptr, &s_framebuffer);
 
     // Descripteurs "bindless" attendus par shader_common.h : textures 2D/3D/cube (sets 0-2), samplers (set 3)
     VkDescriptorType types[4] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER };
@@ -231,16 +221,13 @@ static bool BeginCommands()
     {
         s_frameStarted = true;
         s_uploadOffset = 0;
+        if (s_presented) { Transition(s_presented->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL); s_presented = nullptr; }
         static bool first = true;
         if (first)
         {
             first = false;
             VkClearColorValue black{}, white{ { 1, 0, 1, 1 } };   // magenta temporaire : rend visibles les textures manquantes
             VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            Transition(s_edram, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vkCmdClearColorImage(s_cmd, s_edram.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-            Transition(s_front, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vkCmdClearColorImage(s_cmd, s_front.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
             Transition(s_white, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             vkCmdClearColorImage(s_cmd, s_white.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &range);
             Transition(s_white, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -262,6 +249,129 @@ static VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize ali
 static void EndRenderPass()
 {
     if (s_inRenderPass) { vkCmdEndRenderPass(s_cmd); s_inRenderPass = false; }
+}
+
+// ------------------------------------------------------------------ cibles de rendu (EDRAM)
+
+static VkFormat ColorFormat(uint32_t f)
+{
+    switch (f)
+    {
+    case 0: case 1: return VK_FORMAT_R8G8B8A8_UNORM;                 // 8_8_8_8 (+ gamma)
+    case 2: case 10: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;      // 2_10_10_10
+    case 3: case 12: return VK_FORMAT_R16G16B16A16_SFLOAT;           // 2_10_10_10_FLOAT (7e3) -> flottant 16 bits
+    case 4: case 6: return VK_FORMAT_R16G16_SFLOAT;                  // 16_16 / 16_16_FLOAT
+    case 5: case 7: return VK_FORMAT_R16G16B16A16_SFLOAT;            // 16_16_16_16 / FLOAT
+    case 14: return VK_FORMAT_R32_SFLOAT;
+    case 15: return VK_FORMAT_R32G32_SFLOAT;
+    default: return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+static VkRenderPass RenderPassFor(VkFormat format)
+{
+    auto& rp = s_renderPasses[uint32_t(format)];
+    if (rp) return rp;
+    VkAttachmentDescription att[2]{};
+    att[0].format = format;
+    att[1].format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    for (auto& a : att)
+    {
+        a.samples = VK_SAMPLE_COUNT_1_BIT;
+        a.loadOp = a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        a.storeOp = a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    att[0].initialLayout = att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att[1].initialLayout = att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference color{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }, depth{ 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &color;
+    sub.pDepthStencilAttachment = &depth;
+    VkRenderPassCreateInfo ci{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    ci.attachmentCount = 2;
+    ci.pAttachments = att;
+    ci.subpassCount = 1;
+    ci.pSubpasses = &sub;
+    vkCreateRenderPass(s_dev, &ci, nullptr, &rp);
+    return rp;
+}
+
+static ColorTarget& GetColorTarget(const uint32_t* regs)
+{
+    uint32_t pitch = regs[RB_SURFACE_INFO] & 0x3FFF, info = regs[RB_COLOR_INFO];
+    uint32_t base = info & 0xFFF, format = (info >> 16) & 0xF;
+    uint32_t width = pitch ? pitch : 1280;
+    uint64_t key = uint64_t(base) | uint64_t(format) << 12 | uint64_t(width) << 16;
+    auto& t = s_colorTargets[key];
+    if (!t.image.image)
+    {
+        EndRenderPass();   // effacement initial impossible dans une passe de rendu
+        t.format = ColorFormat(format);
+        t.width = width;
+        t.height = kTargetHeight;
+        t.image = CreateImage(width, kTargetHeight, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, t.format);
+        VkClearColorValue black{};
+        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        Transition(t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearColorImage(s_cmd, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+        KLOG("rendu : cible couleur base %u format %u (%ux%u)", base, format, width, kTargetHeight);
+    }
+    return t;
+}
+
+static DepthTarget& GetDepthTarget(const uint32_t* regs, uint32_t width, uint32_t height)
+{
+    uint32_t base = regs[RB_DEPTH_INFO] & 0xFFF;
+    uint64_t key = uint64_t(base) | uint64_t(width) << 12 | uint64_t(height) << 32;
+    auto& t = s_depthTargets[key];
+    if (!t.image.image)
+    {
+        EndRenderPass();
+        t.width = width; t.height = height;
+        t.image = CreateImage(width, height, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        VkClearDepthStencilValue clear{ 1.0f, 0 };
+        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
+        Transition(t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearDepthStencilImage(s_cmd, t.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    }
+    return t;
+}
+
+// Démarre (ou continue) la passe de rendu sur les cibles désignées par les registres
+static void BeginTargets(const uint32_t* regs)
+{
+    ColorTarget& color = GetColorTarget(regs);
+    DepthTarget& depth = GetDepthTarget(regs, color.width, color.height);
+    if (s_inRenderPass && s_curColor == &color && s_curDepth == &depth) return;
+    EndRenderPass();
+    s_curColor = &color;
+    s_curDepth = &depth;
+    VkRenderPass rp = RenderPassFor(color.format);
+    uint64_t key = XXH3_64bits(std::array<uint64_t, 2>{ uint64_t(color.image.image), uint64_t(depth.image.image) }.data(), 16);
+    auto& fb = s_framebuffers[key];
+    if (!fb)
+    {
+        VkImageView views[2] = { color.image.view, depth.image.view };
+        VkFramebufferCreateInfo ci{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+        ci.renderPass = rp;
+        ci.attachmentCount = 2;
+        ci.pAttachments = views;
+        ci.width = color.width;
+        ci.height = color.height;
+        ci.layers = 1;
+        vkCreateFramebuffer(s_dev, &ci, nullptr, &fb);
+    }
+    Transition(color.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    Transition(depth.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    VkRenderPassBeginInfo rb{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rb.renderPass = rp;
+    rb.framebuffer = fb;
+    rb.renderArea = { { 0, 0 }, { color.width, color.height } };
+    vkCmdBeginRenderPass(s_cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    s_inRenderPass = true;
 }
 
 // ------------------------------------------------------------------ état
@@ -356,11 +466,13 @@ static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
     return ok;
 }
 
-static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, VkPrimitiveTopology topology, uint32_t spec)
+static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, VkPrimitiveTopology topology, uint32_t spec, bool depthOnly)
 {
-    uint32_t blend = regs[RB_BLENDCONTROL0], mask = regs[RB_COLOR_MASK] & 0xF;
-    struct Key { uint64_t vs, ps; uint32_t blend, mask, topology, spec; uint64_t layoutHash; } key{
-        s_vs->containerHash, s_ps->containerHash, blend, mask, uint32_t(topology), spec,
+    uint32_t blend = regs[RB_BLENDCONTROL0], mask = depthOnly ? 0 : regs[RB_COLOR_MASK] & 0xF;
+    uint32_t depthControl = regs[RB_DEPTHCONTROL] & 0x76;   // test, écriture, fonction
+    VkFormat format = s_curColor->format;
+    struct Key { uint64_t vs, ps; uint32_t blend, mask, topology, spec, depthControl, format; uint64_t layoutHash; } key{
+        s_vs->containerHash, s_ps->containerHash, blend, mask, uint32_t(topology), spec, depthControl, uint32_t(format),
         XXH3_64bits(&layout, offsetof(VertexLayout, fetchConst)) };
     uint64_t h = XXH3_64bits(&key, sizeof(key));
     if (auto it = s_pipelines.find(h); it != s_pipelines.end()) return it->second;
@@ -403,6 +515,11 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     ds.dynamicStateCount = 2;
     ds.pDynamicStates = dyn;
     VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    dss.depthTestEnable = (depthControl >> 1) & 1;
+    dss.depthWriteEnable = dss.depthTestEnable && ((depthControl >> 2) & 1);
+    static const VkCompareOp ops[] = { VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL,
+        VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS };
+    dss.depthCompareOp = ops[(depthControl >> 4) & 7];
 
     VkGraphicsPipelineCreateInfo pci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
     pci.stageCount = 2;
@@ -416,7 +533,7 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     pci.pColorBlendState = &cb;
     pci.pDynamicState = &ds;
     pci.layout = s_pipelineLayout;
-    pci.renderPass = s_renderPass;
+    pci.renderPass = RenderPassFor(format);
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline);
     if (r != VK_SUCCESS) KLOG("rendu : échec de création du pipeline (%d)", r);
@@ -426,23 +543,56 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
 
 // ------------------------------------------------------------------ resolve (copie EDRAM -> tampon d'affichage)
 
+static uint32_t s_nextDescriptor = 1;   // 0 = texture de remplacement
+
 static void Resolve(const uint32_t* regs)
 {
     EndRenderPass();
     uint32_t control = regs[RB_COPY_CONTROL];
-    Transition(s_edram, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    Transition(s_front, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy copy{};
-    copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    copy.extent = { kWidth, kHeight, 1 };
-    vkCmdCopyImage(s_cmd, s_edram.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_front.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    if (control & (1 << 8))   // effacement couleur demandé avec la copie
+    ColorTarget& color = GetColorTarget(regs);
+    DepthTarget& depth = GetDepthTarget(regs, color.width, color.height);
+    uint32_t source = control & 7, command = (control >> 20) & 3;
+    uint32_t destBase = regs[RB_COPY_DEST_BASE] & 0x1FFFFFFF, destPitch = regs[RB_COPY_DEST_PITCH] & 0x3FFF;
+    uint32_t destHeight = (regs[RB_COPY_DEST_PITCH] >> 16) & 0x3FFF;
+    uint32_t w = std::min(destPitch ? destPitch : color.width, color.width), h = std::min(destHeight ? destHeight : 720u, color.height);
+
+    if (source < 4 && command != 3 && destBase && w && h)
+    {
+        Resolved& r = s_resolved[destBase];
+        if (!r.image.image || r.width != w || r.height != h || r.format != color.format)
+        {
+            r.image = CreateImage(w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, color.format);
+            r.width = w; r.height = h; r.format = color.format;
+            if (!r.descriptor) r.descriptor = s_nextDescriptor++;
+            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
+            vkUpdateDescriptorSets(s_dev, 1, &wr, 0, nullptr);
+            KLOG("rendu : resolve -> %08X (%ux%u)", destBase, w, h);
+        }
+        Transition(color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy copy{};
+        copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copy.extent = { w, h, 1 };
+        vkCmdCopyImage(s_cmd, color.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        Transition(r.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        s_lastResolved = destBase;
+    }
+    if (control & (1 << 8))   // effacement couleur
     {
         uint32_t c = regs[RB_COLOR_CLEAR];
-        VkClearColorValue color{ { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f } };
+        VkClearColorValue value{ { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f, (c >> 24) / 255.0f } };
         VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        Transition(s_edram, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdClearColorImage(s_cmd, s_edram.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+        Transition(color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearColorImage(s_cmd, color.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+    }
+    if (control & (1 << 9))   // effacement profondeur/stencil (D24S8)
+    {
+        uint32_t d = regs[RB_DEPTH_CLEAR];
+        VkClearDepthStencilValue value{ (d >> 8) / 16777215.0f, d & 0xFF };
+        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
+        Transition(depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearDepthStencilImage(s_cmd, depth.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
     }
 }
 
@@ -497,8 +647,6 @@ static uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitchAligned, uint32_t 
 
 struct CachedTexture { Image image; uint32_t descriptor = 0; uint64_t contentHash = 0; };
 static std::unordered_map<uint64_t, CachedTexture> s_textures;
-static uint32_t s_nextDescriptor = 1;   // 0 = texture de remplacement
-
 static VkComponentSwizzle Swizzle(uint32_t sel)
 {
     static const VkComponentSwizzle map[] = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A,
@@ -515,6 +663,8 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
     if (dim == 0) { width = (f[2] & 0xFFFFFF) + 1; height = 1; dim = 1; }   // 1D : texture 2D d'une ligne
     uint32_t pitch = ((f[0] >> 22) & 0x1FF) << 5;
     bool tiled = f[0] >> 31;
+    if (auto it = s_resolved.find(base & 0x1FFFFFFF); it != s_resolved.end() && it->second.image.image)
+        return it->second.descriptor;   // rendue par le GPU : on échantillonne directement la copie
     TextureFormatInfo info = TextureFormat(format);
     if (dim != 1 || info.vk == VK_FORMAT_UNDEFINED || !base)
     {
@@ -618,7 +768,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     if (!BeginCommands()) return;
     uint32_t edramMode = regs[RB_MODECONTROL] & 7;
     if (edramMode == 6) { Resolve(regs); return; }   // mode copie : c'est un resolve
-    if (edramMode != 4) return;                      // 5 = profondeur seule (pas encore de tampon de profondeur)
+    if (edramMode != 4 && edramMode != 5) return;    // 4 = couleur + profondeur, 5 = profondeur seule
     if (!s_vs || !s_ps) return;
 
     uint32_t prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
@@ -754,30 +904,26 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     uint32_t colorControl = regs[RB_COLORCONTROL];
     uint32_t spec = 0;
     if ((colorControl & 8) && (s_ps->specConstantsMask & 2)) spec |= 2;   // test alpha (fonction "supérieur ou égal" supposée)
-    VkPipeline pipeline = GetPipeline(regs, layout, topology, spec | (s_vs->specConstantsMask & 1));
+    BeginTargets(regs);
+    VkPipeline pipeline = GetPipeline(regs, layout, topology, spec | (s_vs->specConstantsMask & 1), edramMode == 5);
     if (!pipeline) return;
-
-    if (!s_inRenderPass)
-    {
-        Transition(s_edram, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        VkRenderPassBeginInfo rb{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-        rb.renderPass = s_renderPass;
-        rb.framebuffer = s_framebuffer;
-        rb.renderArea = { { 0, 0 }, { kWidth, kHeight } };
-        vkCmdBeginRenderPass(s_cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-        s_inRenderPass = true;
-    }
+    uint32_t tw = s_curColor->width, th = s_curColor->height;
 
     // Viewport Xenos (échelle/décalage) ; une hauteur négative retourne l'axe Y comme D3D
     float xs, xo, ys, yo;
     memcpy(&xs, &regs[PA_CL_VPORT_XSCALE], 4); memcpy(&xo, &regs[PA_CL_VPORT_XOFFSET], 4);
     memcpy(&ys, &regs[PA_CL_VPORT_YSCALE], 4); memcpy(&yo, &regs[PA_CL_VPORT_YOFFSET], 4);
     // XenosRecomp suit la convention D3D (y vers le haut) : on inverse le signe Xenos pour Vulkan (y vers le bas)
-    VkViewport viewport{ xo - xs, yo + ys, 2 * xs, -2 * ys, 0.0f, 1.0f };
-    if (!(regs[PA_CL_VTE_CNTL] & 1) || xs == 0) viewport = { 0, float(kHeight), float(kWidth), -float(kHeight), 0, 1 };
+    float zs, zo;
+    memcpy(&zs, &regs[PA_CL_VPORT_ZSCALE], 4); memcpy(&zo, &regs[PA_CL_VPORT_ZOFFSET], 4);
+    float zmin = std::clamp(zo, 0.0f, 1.0f), zmax = std::clamp(zo + zs, 0.0f, 1.0f);
+    if (zs == 0) { zmin = 0; zmax = 1; }
+    VkViewport viewport{ xo - xs, yo + ys, 2 * xs, -2 * ys, zmin, zmax };
+    if (!(regs[PA_CL_VTE_CNTL] & 1) || xs == 0) viewport = { 0, 720.0f, 1280.0f, -720.0f, 0, 1 };
     uint32_t tl = regs[PA_SC_WINDOW_SCISSOR_TL], br = regs[PA_SC_WINDOW_SCISSOR_BR];
     VkRect2D scissor{ { int32_t(tl & 0x7FFF), int32_t((tl >> 16) & 0x7FFF) }, { (br & 0x7FFF) - (tl & 0x7FFF), ((br >> 16) & 0x7FFF) - ((tl >> 16) & 0x7FFF) } };
-    if (scissor.extent.width == 0 || scissor.extent.width > kWidth || scissor.extent.height > kHeight) scissor = { { 0, 0 }, { kWidth, kHeight } };
+    if (scissor.extent.width == 0 || scissor.offset.x + scissor.extent.width > tw || scissor.offset.y + scissor.extent.height > th)
+        scissor = { { 0, 0 }, { std::min(tw, 1280u), std::min(th, 720u) } };
     vkCmdSetViewport(s_cmd, 0, 1, &viewport);
     vkCmdSetScissor(s_cmd, 0, 1, &scissor);
 
@@ -798,14 +944,20 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
 // Paquet de présentation inséré par VdSwap : affiche le tampon d'affichage
 uint64_t g_presentCount;
 
-void RenderPresent()
+void RenderPresent(uint32_t frontBuffer)
 {
-    static int logged;
-    if (logged++ < 5) KLOG("RenderPresent #%d", logged);
     if (!BeginCommands()) return;
     EndRenderPass();
-    Transition(s_front, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    VulkanPresentFrame(s_front.image, kWidth, kHeight);
+    auto it = s_resolved.find(frontBuffer & 0x1FFFFFFF);
+    if (it == s_resolved.end()) it = s_resolved.find(s_lastResolved);
+    if (it != s_resolved.end())
+    {
+        Transition(it->second.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VulkanPresentFrame(it->second.image.image, it->second.width, it->second.height);
+        s_presented = &it->second;
+    }
+    else
+        VulkanPresentFrame(VK_NULL_HANDLE, 1280, 720);
     s_frameStarted = false;
     g_presentCount++;
 }
