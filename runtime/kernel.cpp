@@ -703,7 +703,11 @@ KFUNC(XamInputGetState)   // (user, flags, state)
         if (ARG(3) != 0) RET(1167);
         memset(g_base + s, 0, 16);
         Wr32(s, ++packet);
-        Wr16(s + 4, KeyboardButtons());
+        uint16_t kb = KeyboardButtons();
+        Wr16(s + 4, kb);
+        static uint32_t calls, pressed; calls++; if (kb) pressed++;
+        static auto last = std::chrono::steady_clock::now();
+        if (getenv("IKARUGA_INPUTLOG") && std::chrono::steady_clock::now() - last > std::chrono::seconds(3)) { last = std::chrono::steady_clock::now(); KLOG("XamInputGetState : %u appels, %u avec boutons (flags %08X, retour %08X)", calls, pressed, ARG(4), uint32_t(ctx.lr)); }
         RET(0);
     }
     uint16_t b = KeyboardButtons();

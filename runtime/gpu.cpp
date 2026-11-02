@@ -12,6 +12,7 @@
 
 static uint32_t s_regs[0x8000];
 static uint32_t s_ringBase, s_ringSize, s_rptr, s_rptrWriteBack;
+uint32_t g_gpuRptr, g_gpuLastWptr;   // débogage
 static uint32_t s_swapCounter;
 static uint32_t s_interruptCallback, s_interruptCallbackCtx;
 static PPCContext s_ctx;   // contexte invité pour appeler le callback d'interruption depuis le thread GPU
@@ -272,8 +273,10 @@ static void ExecutePacket(Reader& r)
     case 0x22:   // DRAW_INDX : (viz query, initiateur, ...)
     {
         r.Read(); uint32_t initiator = r.Read();
+        uint32_t dmaBase = 0, dmaSize = 0;
+        if (((initiator >> 6) & 3) == 0) { dmaBase = r.Read(); dmaSize = r.Read(); }   // index en mémoire (VGT_DMA_BASE/SIZE)
         RecordDraw(initiator);
-        RenderDraw(s_regs, initiator, Phys);
+        RenderDraw(s_regs, initiator, Phys, dmaBase, dmaSize);
         break;
     }
     case 0x36:   // DRAW_INDX_2 : (initiateur, données inline)
@@ -357,10 +360,29 @@ static void GpuThread()
     {
         uint32_t wptr = Rd32(MMIO_BASE + REG_CP_RB_WPTR * 4);
         if (!s_ringBase || wptr == s_rptr) { std::this_thread::sleep_for(std::chrono::microseconds(100)); continue; }
-        Reader r{ s_ringBase, s_ringSize / 4, s_rptr, true };
-        while (r.pos != wptr) ExecutePacket(r);
-        s_rptr = wptr;
+        // N'exécute que des paquets entièrement publiés : un paquet qui dépasse wptr attend la suite
+        // (sinon la lecture saute par-dessus wptr et refait tout le tour du ring)
+        uint32_t size = s_ringSize / 4;
+        Reader r{ s_ringBase, size, s_rptr, true };
+        while (r.pos != wptr)
+        {
+            uint32_t available = (wptr + size - r.pos) % size;
+            uint32_t header = Rd32(Phys(s_ringBase + r.pos * 4));
+            uint32_t length;
+            switch (header >> 30)
+            {
+            case 0: length = 1 + ((header >> 16) & 0x3FFF) + 1; break;
+            case 1: length = 3; break;
+            case 2: length = 1; break;
+            default: length = 1 + ((header >> 16) & 0x3FFF) + 1; break;
+            }
+            if (length > available) break;
+            ExecutePacket(r);
+        }
+        s_rptr = r.pos;
+        g_gpuRptr = s_rptr; g_gpuLastWptr = wptr;
         if (s_rptrWriteBack) Wr32(s_rptrWriteBack, s_rptr);
+        if (r.pos != wptr) std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 }
 

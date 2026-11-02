@@ -64,6 +64,7 @@ PPC_FUNC(sub_8216F760)
 }
 
 extern uint32_t g_fenceTarget;
+extern uint32_t g_gpuRptr, g_gpuLastWptr;
 extern "C" PPC_FUNC(__imp__sub_821600C8);
 PPC_FUNC(sub_821600C8)
 {
@@ -73,8 +74,8 @@ PPC_FUNC(sub_821600C8)
     if (std::chrono::steady_clock::now() - last > std::chrono::seconds(3))
     {
         last = std::chrono::steady_clock::now();
-        KLOG("attente GPU (retour %08X) : dev=%08X fence=%08X dernière=%08X wptr=%08X rptr=%08X +13232=%08X écriture D3D=%08X +52=%08X +56=%08X cible=%08X", uint32_t(ctx.lr),
-            dev, Rd32(Rd32(dev + 10896)), Rd32(dev + 10908), Rd32(0x7FC80714), Rd32(0xA020A03C), Rd32(dev + 13232), Rd32(dev + 48), Rd32(dev + 52), Rd32(dev + 56), g_fenceTarget);
+        KLOG("attente GPU (retour %08X) : dev=%08X fence=%08X dernière=%08X wptr=%08X rptr=%08X +13232=%08X écriture D3D=%08X +52=%08X +56=%08X cible=%08X gpu: rptr=%X wptr vu=%X", uint32_t(ctx.lr),
+            dev, Rd32(Rd32(dev + 10896)), Rd32(dev + 10908), Rd32(0x7FC80714), Rd32(0xA020A03C), Rd32(dev + 13232), Rd32(dev + 48), Rd32(dev + 52), Rd32(dev + 56), g_fenceTarget, g_gpuRptr, g_gpuLastWptr);
         for (uint32_t w : { 0x40004F5Cu, 0x40004FACu })
         {
             uint32_t sh = Rd32(w);

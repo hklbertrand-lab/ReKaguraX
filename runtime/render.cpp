@@ -378,6 +378,8 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     vi.pVertexAttributeDescriptions = layout.attributes;
     VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     ia.topology = topology;
+    ia.primitiveRestartEnable = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+        topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
     vp.viewportCount = vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
@@ -455,7 +457,16 @@ static TextureFormatInfo TextureFormat(uint32_t fmt)
     case 2:  return { VK_FORMAT_R8_UNORM, 1, 1 };                    // k_8
     case 4:  return { VK_FORMAT_R5G6B5_UNORM_PACK16, 1, 2 };         // k_5_6_5
     case 6:  return { VK_FORMAT_B8G8R8A8_UNORM, 1, 4 };              // k_8_8_8_8 (ARGB big-endian)
+    case 10: return { VK_FORMAT_R8G8_UNORM, 1, 2 };                  // k_8_8
     case 15: return { VK_FORMAT_B4G4R4A4_UNORM_PACK16, 1, 2 };       // k_4_4_4_4
+    case 24: return { VK_FORMAT_R16_UNORM, 1, 2 };                   // k_16
+    case 25: return { VK_FORMAT_R16G16_UNORM, 1, 4 };                // k_16_16
+    case 26: return { VK_FORMAT_R16G16B16A16_UNORM, 1, 8 };          // k_16_16_16_16
+    case 30: return { VK_FORMAT_R16_SFLOAT, 1, 2 };                  // k_16_FLOAT
+    case 31: return { VK_FORMAT_R16G16_SFLOAT, 1, 4 };               // k_16_16_FLOAT
+    case 32: return { VK_FORMAT_R16G16B16A16_SFLOAT, 1, 8 };         // k_16_16_16_16_FLOAT
+    case 36: return { VK_FORMAT_R32_SFLOAT, 1, 4 };                  // k_32_FLOAT
+    case 37: return { VK_FORMAT_R32G32_SFLOAT, 1, 8 };               // k_32_32_FLOAT
     case 18: return { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 8 };        // k_DXT1
     case 19: return { VK_FORMAT_BC2_UNORM_BLOCK, 4, 16 };            // k_DXT2_3
     case 20: return { VK_FORMAT_BC3_UNORM_BLOCK, 4, 16 };            // k_DXT4_5
@@ -595,7 +606,7 @@ static uint32_t GetSampler(const uint32_t* f)
 
 // ------------------------------------------------------------------ dessin
 
-void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint32_t))
+void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint32_t), uint32_t dmaBase, uint32_t dmaSize)
 {
     static int logged;
     static uint64_t drawFrom = getenv("IKARUGA_DRAWLOG") ? strtoull(getenv("IKARUGA_DRAWLOG"), nullptr, 10) : 0;
@@ -611,7 +622,30 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     if (!s_vs || !s_ps) return;
 
     uint32_t prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
-    if (source != 2) { static int warned; if (!warned++) KLOG("rendu : dessins indexés pas encore gérés"); return; }
+    if (source == 1) { static int warned; if (!warned++) KLOG("rendu : index immédiats non gérés"); return; }
+
+    // Index en mémoire (source DMA) : 16 ou 32 bits, ordre des octets dans VGT_DMA_SIZE[31:30], décalage VGT_INDX_OFFSET
+    bool indexed = source == 0;
+    std::vector<uint32_t> guestIndices;
+    uint32_t fetchCount = count;   // nombre de sommets à copier
+    if (indexed)
+    {
+        bool is32 = (initiator >> 11) & 1;
+        uint32_t endian = dmaSize >> 30, indexOffset = regs[0x2102];
+        const uint8_t* src = g_base + phys(dmaBase & ~(is32 ? 3u : 1u));
+        uint32_t maxIndex = 0;
+        guestIndices.resize(count);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            uint32_t v;
+            if (is32) { memcpy(&v, src + i * 4, 4); v = SwapEndian(v, endian); }
+            else { uint16_t h; memcpy(&h, src + i * 2, 2); v = (endian == 1 || endian == 2) ? __builtin_bswap16(h) : h; if (v == 0xFFFF) v = 0xFFFFFFFF; }
+            if (v != 0xFFFFFFFF) { v += indexOffset; maxIndex = std::max(maxIndex, v); }
+            guestIndices[i] = v;
+        }
+        fetchCount = count ? maxIndex + 1 : 0;
+        if (prim == 8) { static int warned; if (!warned++) KLOG("rendu : rectangles indexés non gérés"); return; }
+    }
 
     VertexLayout layout;
     if (!DecodeVertexLayout(regs, layout)) return;
@@ -629,7 +663,11 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
     case 13:   // liste de quads -> triangles indexés
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        for (uint32_t q = 0; q + 3 < count; q += 4) indices.insert(indices.end(), { q, q + 1, q + 2, q, q + 2, q + 3 });
+        for (uint32_t q = 0; q + 3 < count; q += 4)
+        {
+            auto at = [&](uint32_t k) { return indexed ? guestIndices[q + k] : q + k; };
+            indices.insert(indices.end(), { at(0), at(1), at(2), at(0), at(2), at(3) });
+        }
         break;
     case 8:    // liste de rectangles : le 4e sommet est déduit (v1 + v2 - v0), ce qui exige des attributs float32
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -639,6 +677,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         { static int warned; if (!warned++) KLOG("rendu : primitive %u non gérée", prim); }
         return;
     }
+    if (indexed && prim != 13) indices = guestIndices;
 
     // Sommets : copie de chaque flux en remettant les mots de 32 bits en little-endian
     VkBuffer buffers[16];
@@ -647,9 +686,9 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     {
         uint32_t d0 = regs[FETCH_CONSTANTS + layout.fetchConst[b] * 2], d1 = regs[FETCH_CONSTANTS + layout.fetchConst[b] * 2 + 1];
         uint32_t base = d0 & ~3u, sizeBytes = ((d1 >> 2) & 0xFFFFFF) * 4, stride = layout.bindings[b].stride;
-        uint32_t needed = stride ? stride * count : sizeBytes;
+        uint32_t needed = stride ? stride * fetchCount : sizeBytes;
         uint32_t bytes = std::min(needed, sizeBytes ? sizeBytes : needed);
-        uint32_t outVertices = prim == 8 ? count / 3 * 4 : count;
+        uint32_t outVertices = prim == 8 ? count / 3 * 4 : fetchCount;
         VkDeviceSize at = Upload(nullptr, VkDeviceSize(std::max(stride, 4u)) * outVertices + 16);
         uint32_t* dst = (uint32_t*)(s_uploadPtr + at);
         const uint8_t* src = g_base + phys(base);
