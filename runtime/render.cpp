@@ -678,6 +678,12 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     }
 
     // Constantes : VS = registres ALU 0-255, PS = 256-479 (float4, valeurs déjà en ordre hôte)
+    if (getenv("IKARUGA_FADELOG") && s_ps->containerHash == 0xd721fb273c54220aull)
+    {
+        static int n;
+        float c[4]; memcpy(c, regs + ALU_CONSTANTS + 256 * 4, 16);
+        if (n++ % 60 == 0) KLOG("remplissage g_vMCol = %.3f %.3f %.3f %.3f, blend %08X", c[0], c[1], c[2], c[3], regs[RB_BLENDCONTROL0]);
+    }
     VkDeviceSize vsConst = Upload(regs + ALU_CONSTANTS, 4096, 256);
     VkDeviceSize psConst = Upload(regs + ALU_CONSTANTS + 256 * 4, 3584, 256);
     uint8_t shared[512]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha
@@ -717,7 +723,8 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     float xs, xo, ys, yo;
     memcpy(&xs, &regs[PA_CL_VPORT_XSCALE], 4); memcpy(&xo, &regs[PA_CL_VPORT_XOFFSET], 4);
     memcpy(&ys, &regs[PA_CL_VPORT_YSCALE], 4); memcpy(&yo, &regs[PA_CL_VPORT_YOFFSET], 4);
-    VkViewport viewport{ xo - xs, yo - ys, 2 * xs, 2 * ys, 0.0f, 1.0f };
+    // XenosRecomp suit la convention D3D (y vers le haut) : on inverse le signe Xenos pour Vulkan (y vers le bas)
+    VkViewport viewport{ xo - xs, yo + ys, 2 * xs, -2 * ys, 0.0f, 1.0f };
     if (!(regs[PA_CL_VTE_CNTL] & 1) || xs == 0) viewport = { 0, float(kHeight), float(kWidth), -float(kHeight), 0, 1 };
     uint32_t tl = regs[PA_SC_WINDOW_SCISSOR_TL], br = regs[PA_SC_WINDOW_SCISSOR_BR];
     VkRect2D scissor{ { int32_t(tl & 0x7FFF), int32_t((tl >> 16) & 0x7FFF) }, { (br & 0x7FFF) - (tl & 0x7FFF), ((br >> 16) & 0x7FFF) - ((tl >> 16) & 0x7FFF) } };

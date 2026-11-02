@@ -1,8 +1,10 @@
 // Réimplémentation des fonctions noyau Xbox 360 (xboxkrnl / xam) utilisées par Ikaruga
 #include "guest.h"
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -70,6 +72,7 @@ struct KThread : KEvent   // signalé quand le thread se termine
 {
     uint32_t guestThread = 0, startAddr = 0, startCtx = 0, xapiStartup = 0, stackSize = 0;
     std::mutex suspendMutex; std::condition_variable suspendCv; bool suspended = false;
+    PPCContext ctx;   // préparé à la création : le KTHREAD invité existe même si le thread est suspendu
     KThread() { manualReset = true; }
 };
 
@@ -267,15 +270,26 @@ KFUNC(KeReleaseSemaphore)   // (sem, increment, adjustment, wait)
     RET(sem ? sem->Release(ARG(5)) : 0);
 }
 
+// Attente sans délai : par tranches de 2 s, en signalant les attentes longues (débogage des blocages)
+static bool WaitLogged(KObject& o, int64_t timeoutMs, const char* what, uint32_t id, uint32_t lr)
+{
+    if (timeoutMs >= 0) return o.Wait(timeoutMs);
+    for (int slices = 0;; slices++)
+    {
+        if (o.Wait(2000)) return true;
+        if (slices == 0) KLOG("attente longue : %s %08X (retour vers %08X)", what, id, lr);
+    }
+}
+
 KFUNC(KeWaitForSingleObject)   // (object, reason, mode, alertable, pTimeout)
 {
-    RET(FromDispatcher(ARG(3))->Wait(TimeoutMs(ARG(7))) ? STATUS_SUCCESS : STATUS_TIMEOUT);
+    RET(WaitLogged(*FromDispatcher(ARG(3)), TimeoutMs(ARG(7)), "objet", ARG(3), uint32_t(ctx.lr)) ? STATUS_SUCCESS : STATUS_TIMEOUT);
 }
 KFUNC(NtWaitForSingleObjectEx)   // (handle, mode, alertable, pTimeout)
 {
     auto o = FromHandle(ARG(3));
     if (!o) RET(STATUS_INVALID_HANDLE);
-    RET(o->Wait(TimeoutMs(ARG(6))) ? STATUS_SUCCESS : STATUS_TIMEOUT);
+    RET(WaitLogged(*o, TimeoutMs(ARG(6)), "handle", ARG(3), uint32_t(ctx.lr)) ? STATUS_SUCCESS : STATUS_TIMEOUT);
 }
 
 // Attente multiple simplifiée : interrogation périodique
@@ -293,6 +307,12 @@ static uint32_t WaitMultiple(std::vector<std::shared_ptr<KObject>> objs, bool wa
         }
         if (waitAll && count == objs.size()) return STATUS_SUCCESS;
         if (timeoutMs >= 0 && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeoutMs)) return STATUS_TIMEOUT;
+        if (timeoutMs < 0 && std::chrono::steady_clock::now() - start >= std::chrono::seconds(2))
+        {
+            static int logged;
+            if (logged++ < 5) KLOG("attente longue : %zu objets (tous=%d)", objs.size(), waitAll);
+            start = std::chrono::steady_clock::now() + std::chrono::hours(1000);
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
 }
@@ -343,9 +363,8 @@ static void ThreadMain(std::shared_ptr<KThread> t)
         std::unique_lock l(t->suspendMutex);
         t->suspendCv.wait(l, [&] { return !t->suspended; });
     }
-    PPCContext ctx;
-    GuestInitThreadContext(ctx, t->stackSize);
-    t->guestThread = Rd32(ctx.r13.u32 + 0x100);
+    PPCContext& ctx = t->ctx;
+    KLOG("thread %08X démarré (KTHREAD %08X)", t->startAddr, t->guestThread);
     if (t->xapiStartup)
     {
         ctx.r3.u64 = t->startAddr; ctx.r4.u64 = t->startCtx;
@@ -365,12 +384,12 @@ KFUNC(ExCreateThread)   // (pHandle, stackSize, pThreadId, xapiStartup, startAdd
     t->stackSize = ARG(4); t->xapiStartup = ARG(6); t->startAddr = ARG(7); t->startCtx = ARG(8);
     t->suspended = ARG(9) & 1;
     KLOG("ExCreateThread start=%08X ctx=%08X xapi=%08X flags=%X", t->startAddr, t->startCtx, t->xapiStartup, ARG(9));
+    GuestInitThreadContext(t->ctx, t->stackSize);
+    t->guestThread = Rd32(t->ctx.r13.u32 + 0x100);
     uint32_t h = NewHandle(t);
     if (ARG(3)) Wr32(ARG(3), h);
-    if (ARG(5)) Wr32(ARG(5), h);
+    if (ARG(5)) Wr32(ARG(5), Rd32(t->guestThread + 0x14C));   // identifiant du thread
     std::thread(ThreadMain, t).detach();
-    // Attendre que le KTHREAD invité existe pour que ObReferenceObjectByHandle le renvoie
-    if (!t->suspended) while (!t->guestThread) std::this_thread::yield();
     RET(STATUS_SUCCESS);
 }
 
@@ -382,6 +401,7 @@ KFUNC(KeResumeThread)
         for (auto& [h, o] : s_handles)
             if (auto k = std::dynamic_pointer_cast<KThread>(o); k && (k->guestThread == ARG(3) || h == ARG(3))) t = k;
     }
+    KLOG("KeResumeThread(%08X) -> %s", ARG(3), t ? "trouvé" : "inconnu");
     if (t) { std::lock_guard l(t->suspendMutex); t->suspended = false; t->suspendCv.notify_all(); }
     RET(0);
 }
@@ -561,9 +581,39 @@ static SDL_Gamepad* Pad(uint32_t index)
     return pads[index];
 }
 
+// Clavier = manette virtuelle du joueur 1 (toujours connectée) : Entrée=START, Échap=BACK, flèches=croix,
+// W/X/C/V=A/B/X/Y (disposition AZERTY : touches du bas à gauche). IKARUGA_AUTOSTART=n appuie sur START
+// toutes les n images (tests sans clavier).
+static uint16_t KeyboardButtons()
+{
+    const bool* k = SDL_GetKeyboardState(nullptr);
+    uint16_t b = 0;
+    if (k)
+    {
+        if (k[SDL_SCANCODE_UP]) b |= 0x1;
+        if (k[SDL_SCANCODE_DOWN]) b |= 0x2;
+        if (k[SDL_SCANCODE_LEFT]) b |= 0x4;
+        if (k[SDL_SCANCODE_RIGHT]) b |= 0x8;
+        if (k[SDL_SCANCODE_RETURN]) b |= 0x10;
+        if (k[SDL_SCANCODE_ESCAPE]) b |= 0x20;
+        if (k[SDL_SCANCODE_Z]) b |= 0x1000;   // touche "W" en AZERTY
+        if (k[SDL_SCANCODE_X]) b |= 0x2000;
+        if (k[SDL_SCANCODE_C]) b |= 0x4000;
+        if (k[SDL_SCANCODE_V]) b |= 0x8000;
+    }
+    static const char* autoStart = getenv("IKARUGA_AUTOSTART");
+    if (autoStart)
+    {
+        static uint32_t calls;
+        uint32_t period = std::max(1, atoi(autoStart)) * 4;
+        if (calls++ % period < 4) b |= 0x10;
+    }
+    return b;
+}
+
 KFUNC(XamInputGetCapabilities)   // (user, flags, caps)
 {
-    if (!Pad(ARG(3))) RET(1167);   // ERROR_DEVICE_NOT_CONNECTED
+    if (!Pad(ARG(3)) && ARG(3) != 0) RET(1167);   // ERROR_DEVICE_NOT_CONNECTED (le clavier tient lieu de manette 1)
     memset(g_base + ARG(5), 0, 0x14);
     Wr8(ARG(5), 1); Wr8(ARG(5) + 1, 1);   // XINPUT_DEVTYPE_GAMEPAD / SUBTYPE_GAMEPAD
     RET(0);
@@ -572,10 +622,17 @@ KFUNC(XamInputGetCapabilities)   // (user, flags, caps)
 KFUNC(XamInputGetState)   // (user, flags, state)
 {
     SDL_Gamepad* p = Pad(ARG(3));
-    if (!p) RET(1167);
     static std::atomic<uint32_t> packet;
     uint32_t s = ARG(5);
-    uint16_t b = 0;
+    if (!p)
+    {
+        if (ARG(3) != 0) RET(1167);
+        memset(g_base + s, 0, 16);
+        Wr32(s, ++packet);
+        Wr16(s + 4, KeyboardButtons());
+        RET(0);
+    }
+    uint16_t b = KeyboardButtons();
     struct { SDL_GamepadButton sdl; uint16_t x; } map[] = {
         { SDL_GAMEPAD_BUTTON_DPAD_UP, 0x1 }, { SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x2 }, { SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x4 },
         { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x8 }, { SDL_GAMEPAD_BUTTON_START, 0x10 }, { SDL_GAMEPAD_BUTTON_BACK, 0x20 },
@@ -602,8 +659,50 @@ KFUNC(XamUserGetSigninState) { RET(ARG(3) == 0 ? 1 : 0); }   // joueur 1 connect
 KFUNC(XamUserGetXUID) { if (ARG(4)) Wr64(ARG(4), 0xE000000000000001ull); RET(0); }
 KFUNC(XamUserGetName) { strncpy((char*)g_base + ARG(4), "Joueur", ARG(5)); RET(0); }
 KFUNC(XamUserCheckPrivilege) { if (ARG(5)) Wr32(ARG(5), 1); RET(0); }
-KFUNC(XNotifyGetNext) { RET(0); }
-KFUNC(XamNotifyCreateListener) { RET(NewHandle(std::make_shared<KEvent>())); }
+// Notifications système : file par écouteur ; comme Xenia, le premier écouteur système reçoit au
+// démarrage XN_SYS_UI (1 puis 0) et deux XN_SYS_SIGNINCHANGED, que certains jeux attendent.
+struct KNotifyListener : KEvent
+{
+    std::deque<std::pair<uint32_t, uint32_t>> queue;   // (identifiant, paramètre)
+    uint64_t mask = 0;
+};
+
+KFUNC(XamNotifyCreateListener)   // (masque 64 bits, version max)
+{
+    auto l = std::make_shared<KNotifyListener>();
+    l->manualReset = true;
+    l->mask = ctx.r3.u64;
+    static bool startupSent;
+    if (!startupSent && (l->mask & 1))   // XNOTIFY_SYSTEM
+    {
+        startupSent = true;
+        l->queue = { { 0x00000009, 1 }, { 0x00000009, 0 }, { 0x0000000A, 1 }, { 0x0000000A, 1 } };
+        l->Signal();
+    }
+    KLOG("XamNotifyCreateListener masque=%llx", (unsigned long long)l->mask);
+    RET(NewHandle(l));
+}
+
+KFUNC(XNotifyGetNext)   // (handle, idCherché, pId, pParam)
+{
+    if (ARG(6)) Wr32(ARG(6), 0);
+    if (!ARG(5)) RET(0);
+    Wr32(ARG(5), 0);
+    auto l = std::dynamic_pointer_cast<KNotifyListener>(FromHandle(ARG(3)));
+    if (!l) RET(0);
+    std::lock_guard lock(l->m);
+    for (auto it = l->queue.begin(); it != l->queue.end(); ++it)
+        if (!ARG(4) || it->first == ARG(4))
+        {
+            Wr32(ARG(5), it->first);
+            if (ARG(6)) Wr32(ARG(6), it->second);
+            KLOG("XNotifyGetNext -> %08X (%u)", it->first, it->second);
+            l->queue.erase(it);
+            if (l->queue.empty()) l->signaled = false;
+            return void(ctx.r3.u64 = 1);
+        }
+    RET(0);
+}
 KFUNC(XamContentGetDeviceState) { RET(0); }
 KFUNC(XamVoiceHeadsetPresent) { RET(0); }
 KFUNC(NetDll_XNetStartup) { RET(0); }
@@ -738,3 +837,40 @@ KFUNC(_vsnprintf)   // (buffer, count, format, va_list) : formatage minimal faç
     if (ARG(4)) g_base[ARG(3) + n] = 0;
     RET(n);
 }
+
+// ---------------------------------------------------------------- audio (XAudio) : pilote de rendu
+// Le jeu enregistre un callback que le système appelle à chaque trame consommée (256 échantillons,
+// 48 kHz -> 5,33 ms). Sans ces appels, son moteur audio (et les écrans qui attendent un son) se bloque.
+// Les échantillons soumis sont pour l'instant ignorés.
+
+static std::atomic<uint32_t> s_audioCallback, s_audioCallbackArg;
+static std::atomic<bool> s_audioRunning;
+
+KFUNC(XAudioRegisterRenderDriverClient)   // (callbackPtr -> {fonction, argument}, pDriver)
+{
+    s_audioCallback = Rd32(ARG(3));
+    s_audioCallbackArg = Rd32(ARG(3) + 4);
+    Wr32(ARG(4), 0x41550000);
+    KLOG("XAudio : client enregistré (callback %08X, argument %08X)", s_audioCallback.load(), s_audioCallbackArg.load());
+    if (!s_audioRunning.exchange(true))
+        std::thread([] {
+            PPCContext ctx;
+            GuestInitThreadContext(ctx, 0x10000);
+            auto next = std::chrono::steady_clock::now();
+            while (s_audioRunning)
+            {
+                next += std::chrono::microseconds(5333);
+                std::this_thread::sleep_until(next);
+                if (uint32_t cb = s_audioCallback)
+                {
+                    ctx.r3.u64 = s_audioCallbackArg;
+                    GuestCall(ctx, cb);
+                }
+            }
+        }).detach();
+    RET(0);
+}
+KFUNC(XAudioUnregisterRenderDriverClient) { s_audioCallback = 0; RET(0); }
+KFUNC(XAudioSubmitRenderDriverFrame) { RET(0); }
+KFUNC(XAudioGetVoiceCategoryVolume) { if (ARG(4)) Wr32(ARG(4), 0x3F800000); RET(0); }   // 1.0f
+KFUNC(XAudioGetVoiceCategoryVolumeChangeMask) { if (ARG(4)) Wr32(ARG(4), 0); RET(0); }
