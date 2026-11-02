@@ -485,6 +485,9 @@ KFUNC(ExCreateThread)   // (pHandle, stackSize, pThreadId, xapiStartup, startAdd
     t->suspended = ARG(9) & 1;
     KLOG("ExCreateThread start=%08X ctx=%08X xapi=%08X flags=%X", t->startAddr, t->startCtx, t->xapiStartup, ARG(9));
     GuestInitThreadContext(t->ctx, t->stackSize);
+    // Octet haut des drapeaux : masque d'affinité (ex. 0x10000001 = CPU 4, suspendu) ; le moteur audio
+    // en dépend (rendez-vous par numéro de processeur)
+    if (uint32_t mask = ARG(9) >> 24) Wr8(t->ctx.r13.u32 + 0x10C, uint8_t(__builtin_ctz(mask)));
     t->guestThread = Rd32(t->ctx.r13.u32 + 0x100);
     { std::lock_guard l(s_objMutex); s_threadDispatchers[t->guestThread] = t; }
     uint32_t h = NewHandle(t);
@@ -652,7 +655,7 @@ KFUNC(NtReadFile)   // (handle, event, apc, apcCtx, iosb, buffer, length, pOffse
     Wr32(ARG(7), n ? STATUS_SUCCESS : STATUS_END_OF_FILE); Wr32(ARG(7) + 4, (uint32_t)n);
     if (ARG(4)) if (auto ev = FromHandle(ARG(4))) ev->Signal();
     static int logged;
-    if (getenv("IKARUGA_IOLOG") && logged++ < 40)
+    if (getenv("IKARUGA_IOLOG") && logged++ < 4000)
         KLOG("NtReadFile %s : %u octets à %lld -> %zu (event %08X, apc %08X, ctx %08X)", file->path.filename().string().c_str(),
             ARG(9), ARG(10) ? (long long)Rd64(ARG(10)) : -1ll, n, ARG(4), ARG(5), ARG(6));
     RET(n ? STATUS_SUCCESS : STATUS_END_OF_FILE);
@@ -1059,7 +1062,15 @@ KFUNC(_vsnprintf)   // (buffer, count, format, va_list) : formatage minimal faç
 // ---------------------------------------------------------------- audio (XAudio) : pilote de rendu
 // Le jeu enregistre un callback que le système appelle à chaque trame consommée (256 échantillons,
 // 48 kHz -> 5,33 ms). Sans ces appels, son moteur audio (et les écrans qui attendent un son) se bloque.
-// Les échantillons soumis sont pour l'instant ignorés.
+// Les trames soumises partent vers SDL (apu.cpp) ; une fois la sortie ouverte, le rythme des appels suit la
+// file de la carte son (4 trames d'avance, ~21 ms) au lieu d'un minuteur qui dériverait.
+
+void ApuSubmitFrame(uint32_t samples);
+uint32_t ApuQueuedFrames();
+bool ApuOutputOpen();
+uint32_t ApuCreateContext();
+void ApuReleaseContext(uint32_t ptr);
+void ApuInitialize();
 
 static std::atomic<uint32_t> s_audioCallback, s_audioCallbackArg;
 static std::atomic<bool> s_audioRunning;
@@ -1078,8 +1089,15 @@ KFUNC(XAudioRegisterRenderDriverClient)   // (callbackPtr -> {fonction, argument
             auto next = std::chrono::steady_clock::now();
             while (s_audioRunning)
             {
-                next += std::chrono::microseconds(5333);
-                std::this_thread::sleep_until(next);
+                if (ApuOutputOpen())
+                {
+                    if (ApuQueuedFrames() >= 4) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+                }
+                else
+                {
+                    next += std::chrono::microseconds(5333);
+                    std::this_thread::sleep_until(next);
+                }
                 if (uint32_t cb = s_audioCallback)
                 {
                     ctx.r3.u64 = s_audioCallbackArg;
@@ -1090,7 +1108,7 @@ KFUNC(XAudioRegisterRenderDriverClient)   // (callbackPtr -> {fonction, argument
     RET(0);
 }
 KFUNC(XAudioUnregisterRenderDriverClient) { s_audioCallback = 0; RET(0); }
-KFUNC(XAudioSubmitRenderDriverFrame) { RET(0); }
+KFUNC(XAudioSubmitRenderDriverFrame) { ApuSubmitFrame(ARG(4)); RET(0); }   // (driver, samples)
 KFUNC(XAudioGetVoiceCategoryVolume) { if (ARG(4)) Wr32(ARG(4), 0x3F800000); RET(0); }   // 1.0f
 KFUNC(XAudioGetVoiceCategoryVolumeChangeMask) { if (ARG(4)) Wr32(ARG(4), 0); RET(0); }
 
@@ -1273,11 +1291,13 @@ KFUNC(NtSetTimerEx)   // (handle, pÉchéance, apc, mode, apcArg, reprise, péri
 
 KFUNC(NtCancelTimer) { if (auto t = std::dynamic_pointer_cast<KTimer>(FromHandle(ARG(3)))) t->generation++; RET(STATUS_SUCCESS); }
 
-// ---------------------------------------------------------------- XMA (décodeur audio matériel) : contextes sans décodage
+// ---------------------------------------------------------------- XMA (décodeur audio matériel, apu.cpp)
 
-KFUNC(XMACreateContext)   // (pContext)
+KFUNC(XMACreateContext)   // (pContext) : un contexte du tableau matériel (son numéro en dépend)
 {
-    Wr32(ARG(3), GuestAllocPhysical(0x40, 0x40));
-    RET(0);
+    ApuInitialize();
+    uint32_t c = ApuCreateContext();
+    Wr32(ARG(3), c);
+    RET(c ? 0 : 0x8007000E);
 }
-KFUNC(XMAReleaseContext) { RET(0); }
+KFUNC(XMAReleaseContext) { ApuReleaseContext(ARG(3)); RET(0); }

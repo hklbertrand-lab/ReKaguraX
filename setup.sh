@@ -32,6 +32,24 @@ python runtime/gen_stubs.py ppc/ppc_recomp_shared.h runtime/kernel.cpp runtime/i
 build/xex_dump extracted/default.xex build/shaders/in/default.bin 2>/dev/null || true
 (cd build/XenosRecomp/XenosRecomp && ./XenosRecomp ../../shaders/in ../../shaders/shader_cache.cpp ../../../thirdparty/XenosRecomp/XenosRecomp/shader_common.h)
 
-# 3) Jeu
+# 3) FFmpeg réduit au décodeur XMA (statique, sans assembleur). Sous Windows, mingw32-make (fourni par
+#    llvm-mingw) ne comprend pas les chemins /e/... : on les réécrit dans les fichiers générés.
+if [ ! -f thirdparty/ffmpeg-build/libavcodec/libavcodec.a ]; then
+    [ -d thirdparty/ffmpeg-7.1 ] || curl -sSL https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz | tar -xJ -C thirdparty
+    mkdir -p thirdparty/ffmpeg-build/tmp
+    case "$(uname -s)" in MINGW*|MSYS*) TARGET="--target-os=mingw32 --cc=x86_64-w64-mingw32-clang"; MAKE=mingw32-make ;; *) TARGET="--cc=clang"; MAKE=make ;; esac
+    (cd thirdparty/ffmpeg-build && TMPDIR=$PWD/tmp ../ffmpeg-7.1/configure $TARGET --arch=x86_64 --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm \
+        --enable-static --disable-shared --disable-everything --disable-programs --disable-doc --disable-network --disable-avdevice \
+        --disable-avformat --disable-swscale --disable-swresample --disable-avfilter --disable-postproc --disable-asm \
+        --disable-autodetect --disable-debug --enable-decoder=xma1 --enable-decoder=xma2)
+    case "$(uname -s)" in MINGW*|MSYS*) sed -i "s#$(cd thirdparty && pwd)#$(cd thirdparty && pwd -W)#g" thirdparty/ffmpeg-build/Makefile thirdparty/ffmpeg-build/ffbuild/config.mak ;; esac
+    (cd thirdparty/ffmpeg-build && $MAKE -j4 SHELL=sh)
+fi
+# En-têtes publics seuls : la racine des sources contient un fichier VERSION qui masque <version>
+mkdir -p thirdparty/ffmpeg-include/libavcodec thirdparty/ffmpeg-include/libavutil
+cp thirdparty/ffmpeg-7.1/libavcodec/*.h thirdparty/ffmpeg-include/libavcodec/
+cp thirdparty/ffmpeg-7.1/libavutil/*.h thirdparty/ffmpeg-build/libavutil/avconfig.h thirdparty/ffmpeg-build/libavutil/ffversion.h thirdparty/ffmpeg-include/libavutil/
+
+# 4) Jeu
 cmake -S . -B build/game -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build build/game --target ikaruga

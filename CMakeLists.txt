@@ -43,10 +43,14 @@ target_include_directories(ikaruga PRIVATE
     ${XENOS_THIRDPARTY}/xxHash
     ${XENOS_THIRDPARTY}/zstd/lib)
 target_compile_definitions(ikaruga PRIVATE VK_NO_PROTOTYPES)
+# FFmpeg réduit au décodeur XMA (thirdparty/ffmpeg-build, voir setup.sh)
+set(FFMPEG_BUILD ${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg-build)
+target_include_directories(ikaruga PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg-include)
+target_link_libraries(ikaruga PRIVATE ${FFMPEG_BUILD}/libavcodec/libavcodec.a ${FFMPEG_BUILD}/libavutil/libavutil.a $<$<PLATFORM_ID:Windows>:bcrypt>)
 target_link_libraries(ikaruga PRIVATE XenonUtils SDL3::SDL3 libzstd_static $<$<PLATFORM_ID:Windows>:winmm>)
 target_compile_options(ikaruga PRIVATE -march=x86-64-v3 -Wno-unused-label -Wno-unused-variable)
 target_link_options(ikaruga PRIVATE -Wl,-Map=${CMAKE_BINARY_DIR}/ikaruga.map)
-set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-include;${CMAKE_SOURCE_DIR}/runtime/mmio.h")
 
 if(WIN32)
     add_custom_command(TARGET ikaruga POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different

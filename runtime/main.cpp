@@ -259,6 +259,8 @@ int main(int argc, char** argv)
         DWORD old; VirtualProtect(WatchPage(), 0x1000, PAGE_READONLY, &old);
     }
 #endif
+    void ApuInitialize();
+    ApuInitialize();   // registres XMA en place avant le démarrage du jeu
     std::thread game(GuestMain);
 #ifdef _WIN32
     // Débogage : IKARUGA_SAMPLE=1 -> affiche toutes les 2 s où se trouve le thread principal du jeu
