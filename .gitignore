@@ -4,3 +4,4 @@ ppc/
 thirdparty/
 build/
 __pycache__/
+saves/

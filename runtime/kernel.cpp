@@ -554,15 +554,29 @@ static bool EqualNoCase(const std::string& a, const std::string& b)
     return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) { return tolower(x) == tolower(y); });
 }
 
+// Racines créées par XamContentCreateEx (ex. "save:") -> dossiers sur disque
+static std::mutex s_rootsMutex;
+static std::unordered_map<std::string, std::filesystem::path> s_contentRoots;
+
+static std::string Lower(std::string v) { for (auto& c : v) c = char(tolower(c)); return v; }
+
 static std::filesystem::path ResolvePath(std::string p)
 {
     for (auto& c : p) if (c == '\\') c = '/';
-    if (auto colon = p.find(':'); colon != std::string::npos) p = p.substr(colon + 1);
+    std::filesystem::path root = g_gameDir;
+    if (auto colon = p.find(':'); colon != std::string::npos)
+    {
+        std::string device = Lower(p.substr(0, colon));
+        while (!device.empty() && device[0] == '/') device.erase(0, 1);
+        std::lock_guard l(s_rootsMutex);
+        if (auto it = s_contentRoots.find(device); it != s_contentRoots.end()) root = it->second;
+        p = p.substr(colon + 1);
+    }
     for (const char* prefix : { "/Device/Cdrom0", "/Device/Harddisk0/Partition1", "/??/game:" })
         if (p.rfind(prefix, 0) == 0) p = p.substr(strlen(prefix));
     while (!p.empty() && p[0] == '/') p.erase(0, 1);
     // le système de fichiers Xbox ignore la casse
-    std::filesystem::path result = g_gameDir;
+    std::filesystem::path result = root;
     for (const auto& part : std::filesystem::path(p))
     {
         std::filesystem::path next = result / part;
@@ -580,14 +594,25 @@ static std::string ObjectName(uint32_t objAttr)
     return std::string((char*)g_base + Rd32(str + 4), Rd16(str));
 }
 
-static uint32_t OpenFile(uint32_t pHandle, uint32_t objAttr, uint32_t iosb)
+// disposition : 0 SUPERSEDE, 1 OPEN, 2 CREATE, 3 OPEN_IF, 4 OVERWRITE, 5 OVERWRITE_IF ; -1 = ouverture simple
+static uint32_t OpenFile(uint32_t pHandle, uint32_t objAttr, uint32_t iosb, int disposition = 1, bool write = false, bool directory = false)
 {
     std::string name = ObjectName(objAttr);
     auto path = ResolvePath(name);
     auto file = std::make_shared<KFile>();
     file->path = path;
+    bool exists = std::filesystem::exists(path);
+    if (directory && !exists && (disposition == 2 || disposition == 3)) { std::filesystem::create_directories(path); exists = true; }
     file->isDir = std::filesystem::is_directory(path);
-    if (!file->isDir && !(file->f = fopen(path.string().c_str(), "rb")))
+    const char* mode = "rb";
+    if (!file->isDir)
+    {
+        if (disposition == 0 || disposition == 4 || disposition == 5 || (!exists && (disposition == 2 || disposition == 3))) mode = "w+b";
+        else if (write) mode = "r+b";
+        if (disposition == 2 && exists) { if (iosb) Wr32(iosb, 0xC0000035); return 0xC0000035; }   // OBJECT_NAME_COLLISION
+        if (mode[0] == 'w') std::filesystem::create_directories(path.parent_path());
+    }
+    if (!file->isDir && !(file->f = fopen(path.string().c_str(), mode)))
     {
         KLOG("fichier introuvable : %s", name.c_str());
         if (iosb) Wr32(iosb, STATUS_OBJECT_NAME_NOT_FOUND);
@@ -599,7 +624,13 @@ static uint32_t OpenFile(uint32_t pHandle, uint32_t objAttr, uint32_t iosb)
     return STATUS_SUCCESS;
 }
 
-KFUNC(NtCreateFile) { RET(OpenFile(ARG(3), ARG(5), ARG(6))); }   // (pHandle, access, objAttr, iosb, ...)
+// (pHandle, accès, objAttr, iosb, taille alloc, attributs, partage, disposition) ; options en pile (+0x54)
+KFUNC(NtCreateFile)
+{
+    uint32_t options = Rd32(ctx.r1.u32 + 0x54);
+    bool write = ARG(4) & (0x40000000 | 0x2 | 0x4 | 0x10000000);
+    RET(OpenFile(ARG(3), ARG(5), ARG(6), int(ARG(10)), write, options & 1));
+}
 KFUNC(NtOpenFile) { RET(OpenFile(ARG(3), ARG(5), ARG(6))); }
 
 KFUNC(NtReadFile)   // (handle, event, apc, apcCtx, iosb, buffer, length, pOffset)
@@ -615,6 +646,18 @@ KFUNC(NtReadFile)   // (handle, event, apc, apcCtx, iosb, buffer, length, pOffse
         KLOG("NtReadFile %s : %u octets à %lld -> %zu (event %08X, apc %08X, ctx %08X)", file->path.filename().string().c_str(),
             ARG(9), ARG(10) ? (long long)Rd64(ARG(10)) : -1ll, n, ARG(4), ARG(5), ARG(6));
     RET(n ? STATUS_SUCCESS : STATUS_END_OF_FILE);
+}
+
+KFUNC(NtWriteFile)   // (handle, event, apc, apcCtx, iosb, buffer, length, pOffset)
+{
+    auto file = std::dynamic_pointer_cast<KFile>(FromHandle(ARG(3)));
+    if (!file || !file->f) RET(STATUS_INVALID_HANDLE);
+    if (ARG(10)) fseek(file->f, (long)Rd64(ARG(10)), SEEK_SET);
+    size_t n = fwrite(g_base + ARG(8), 1, ARG(9), file->f);
+    fflush(file->f);
+    Wr32(ARG(7), STATUS_SUCCESS); Wr32(ARG(7) + 4, (uint32_t)n);
+    if (ARG(4)) if (auto ev = FromHandle(ARG(4))) ev->Signal();
+    RET(STATUS_SUCCESS);
 }
 
 KFUNC(NtQueryInformationFile)   // (handle, iosb, info, length, class)
@@ -1088,3 +1131,104 @@ void GuestWriteMsr(PPCContext& ctx, uint64_t value)
     ctx.msr = value;
     if (!wasEnabled && enabled) GuestPollInterrupts(ctx);
 }
+
+// Sélecteur de stockage : comme Xenia sans interface, le périphérique 1 (disque dur) est choisi d'office
+KFUNC(XamShowDeviceSelectorUI)   // (joueur, type, flags, taille 64 bits, pDevice, overlapped)
+{
+    if (ARG(7)) Wr32(ARG(7), 1);
+    KLOG("XamShowDeviceSelectorUI -> périphérique 1");
+    if (ARG(8)) RET(CompleteOverlapped(ARG(8), 0));
+    RET(0);
+}
+
+// ---------------------------------------------------------------- contenu (sauvegardes)
+
+// (joueur, nomRacine, XCONTENT_DATA, flags, pDisposition, pLicence, tailleCache, tailleContenu, overlapped en pile)
+KFUNC(XamContentCreateEx)
+{
+    std::string rootName = Lower((char*)g_base + ARG(4));
+    uint32_t data = ARG(5);
+    // XCONTENT_DATA : device (+0), type (+4), nom d'affichage UTF-16 (+8, 128), nom de fichier (+0x108, 42 car.)
+    std::string fileName((char*)g_base + data + 0x108, strnlen((char*)g_base + data + 0x108, 42));
+    std::filesystem::path dir = std::filesystem::path("saves") / (fileName.empty() ? rootName : fileName);
+    bool existed = std::filesystem::exists(dir);
+    std::filesystem::create_directories(dir);
+    { std::lock_guard l(s_rootsMutex); s_contentRoots[rootName] = dir; }
+    if (ARG(7)) Wr32(ARG(7), existed ? 2 : 1);   // disposition : ouvert / créé
+    if (ARG(8)) Wr32(ARG(8), 0xFFFFFFFF);
+    KLOG("XamContentCreateEx : %s: -> %s (%s)", rootName.c_str(), dir.string().c_str(), existed ? "existant" : "créé");
+    uint32_t overlapped = Rd32(ctx.r1.u32 + 0x54);
+    if (overlapped) RET(CompleteOverlapped(overlapped, 0));
+    RET(0);
+}
+
+KFUNC(XamContentClose)   // (nomRacine, overlapped)
+{
+    if (ARG(4)) RET(CompleteOverlapped(ARG(4), 0));
+    RET(0);
+}
+
+KFUNC(XamContentGetDeviceData)   // (device, X_CONTENT_DEVICE_DATA*)
+{
+    uint32_t d = ARG(4);
+    memset(g_base + d, 0, 0x50);
+    Wr32(d, ARG(3)); Wr32(d + 4, 1);                       // id, type disque dur
+    Wr64(d + 8, 20ull << 30); Wr64(d + 16, 10ull << 30);   // 20 Go, 10 Go libres
+    const char* name = "Disque dur";
+    for (int i = 0; name[i]; i++) Wr16(d + 24 + i * 2, uint8_t(name[i]));
+    RET(0);
+}
+
+KFUNC(XamUserWriteProfileSettings)   // (titre, joueur, nb, réglages, overlapped)
+{
+    if (ARG(7)) RET(CompleteOverlapped(ARG(7), 0));
+    RET(0);
+}
+
+// ---------------------------------------------------------------- minuteurs
+
+struct KTimer : KEvent
+{
+    std::atomic<uint64_t> generation{ 0 };
+};
+
+KFUNC(NtCreateTimer)   // (pHandle, objAttr, type : 0 notification / 1 synchronisation)
+{
+    auto t = std::make_shared<KTimer>();
+    t->manualReset = ARG(5) == 0;
+    Wr32(ARG(3), NewHandle(t));
+    RET(STATUS_SUCCESS);
+}
+
+KFUNC(NtSetTimerEx)   // (handle, pÉchéance, apc, mode, apcArg, reprise, période ms, pÉtatPrécédent)
+{
+    auto t = std::dynamic_pointer_cast<KTimer>(FromHandle(ARG(3)));
+    if (!t) RET(STATUS_INVALID_HANDLE);
+    if (ARG(5)) KLOG("NtSetTimerEx : routine APC %08X ignorée", ARG(5));
+    int64_t due = int64_t(Rd64(ARG(4)));
+    int64_t firstMs = due < 0 ? -due / 10000 : 0;   // relatif uniquement (absolu traité comme immédiat)
+    uint32_t period = ARG(9);
+    t->Reset();
+    uint64_t gen = ++t->generation;
+    std::thread([t, gen, firstMs, period] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(firstMs));
+        while (t->generation == gen)
+        {
+            t->Signal();
+            if (!period) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(period));
+        }
+    }).detach();
+    RET(STATUS_SUCCESS);
+}
+
+KFUNC(NtCancelTimer) { if (auto t = std::dynamic_pointer_cast<KTimer>(FromHandle(ARG(3)))) t->generation++; RET(STATUS_SUCCESS); }
+
+// ---------------------------------------------------------------- XMA (décodeur audio matériel) : contextes sans décodage
+
+KFUNC(XMACreateContext)   // (pContext)
+{
+    Wr32(ARG(3), GuestAllocPhysical(0x40, 0x40));
+    RET(0);
+}
+KFUNC(XMAReleaseContext) { RET(0); }
