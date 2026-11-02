@@ -53,12 +53,14 @@ static uint32_t MemRead(uint32_t addr) { return GpuSwap(__builtin_bswap32(Rd32(P
 
 std::recursive_mutex g_interruptMutex;
 std::recursive_mutex& GuestCpuLock(uint32_t cpu);
+bool InterruptsDeliver(uint32_t cpu, uint32_t callback, uint32_t source, uint32_t arg);
 
 void GpuDispatchInterrupt(uint32_t source, uint32_t cpu)
 {
     if (!s_interruptCallback) return;
     std::lock_guard lock(g_interruptMutex);   // le matériel sérialise les interruptions graphiques
-    std::lock_guard cpuLock(GuestCpuLock(cpu));     // pas d'interruption pendant une section "EE = 0" de ce CPU
+    if (InterruptsDeliver(cpu, s_interruptCallback, source, s_interruptCallbackCtx)) return;   // exécutée sur le CPU visé
+    std::lock_guard cpuLock(GuestCpuLock(cpu));     // repli : pas pendant une section "EE = 0" de ce CPU
     Wr8(s_ctx.r13.u32 + 0x10C, (uint8_t)cpu);   // processeur courant vu par le gestionnaire
     s_ctx.r3.u64 = source;
     s_ctx.r4.u64 = s_interruptCallbackCtx;
@@ -367,6 +369,14 @@ static void GpuThread()
         while (r.pos != wptr)
         {
             uint32_t available = (wptr + size - r.pos) % size;
+            // Un wptr qui recule (vu en jeu : -1) donnerait "presque un tour de ring" : ce n'est pas du
+            // travail nouveau, on ne rejoue pas d'anciennes commandes
+            if (available > size - 256)
+            {
+                static int warned;
+                if (warned++ < 5) KLOG("GPU : wptr %X derrière rptr %X, ignoré", wptr, r.pos);
+                break;
+            }
             uint32_t header = Rd32(Phys(s_ringBase + r.pos * 4));
             uint32_t length;
             switch (header >> 30)

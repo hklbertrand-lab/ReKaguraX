@@ -135,3 +135,17 @@ PPC_FUNC(sub_82170B28)
     __imp__sub_82170B28(ctx, base);
     if (on) KLOG("82170B28 sortie  cpu%u ctx=%08X verrou=%u masque=%08X compteur=%u r3=%u", cpu, w, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), ctx.r3.u32);
 }
+
+// D3D : désactive les threads de travail (traitement des commandes déporté sur d'autres CPU). Les bits
+// 0x01000000 << cpu de device+22300 désignent les CPU de ces threads ; sans eux, D3D traite tout en ligne.
+extern "C" PPC_FUNC(__imp__sub_82171348);
+PPC_FUNC(sub_82171348)
+{
+    uint32_t dev = ctx.r3.u32, flags = Rd32(dev + 22300);
+    if (getenv("IKARUGA_NOD3DWORKERS"))   // test : D3D sans threads de travail (bloque plus tôt)
+    {
+        KLOG("D3D : threads de travail désactivés (device+22300 %08X -> %08X)", flags, flags & ~0x3F000000u);
+        Wr32(dev + 22300, flags & ~0x3F000000u);
+    }
+    __imp__sub_82171348(ctx, base);
+}

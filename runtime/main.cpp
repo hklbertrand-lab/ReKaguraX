@@ -180,6 +180,8 @@ void DebugRegisterThread(const char* name)
 #endif
 }
 
+void InterruptsRegisterThread(PPCContext& ctx);
+
 static void GuestMain()
 {
 #ifdef _WIN32
@@ -187,6 +189,7 @@ static void GuestMain()
 #endif
     static PPCContext ctx;
     GuestInitThreadContext(ctx, 0x100000);
+    InterruptsRegisterThread(ctx);
     KLOG("démarrage du jeu à %08X", 0x8217BA20);
     GuestCall(ctx, 0x8217BA20);
     KLOG("le jeu est sorti de son point d'entrée");

@@ -1,8 +1,18 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..3535d50 100644
+index fa91527..f968b27 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -1260,7 +1260,7 @@ bool Recompiler::Recompile(
+@@ -797,7 +797,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DB16CYC:
+-        // no op
++        // Ikaruga : indice d'attente active -> point où le thread peut recevoir ses interruptions
++        println("\tGuestPollInterrupts(ctx);");
+         break;
+ 
+     case PPC_INST_DCBF:
+@@ -1260,7 +1261,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_MFTB:
@@ -11,7 +21,7 @@ index fa91527..3535d50 100644
          break;
  
      case PPC_INST_MR:
-@@ -1292,7 +1292,8 @@ bool Recompiler::Recompile(
+@@ -1292,7 +1293,8 @@ bool Recompiler::Recompile(
  
      case PPC_INST_MTMSRD:
          if (!config.skipMsr)
@@ -21,7 +31,7 @@ index fa91527..3535d50 100644
          break;
  
      case PPC_INST_MTXER:
-@@ -2249,6 +2250,160 @@ bool Recompiler::Recompile(
+@@ -2249,6 +2251,160 @@ bool Recompiler::Recompile(
  
          break;
  
@@ -183,10 +193,10 @@ index fa91527..3535d50 100644
          println("\t{}.u64 = {}.u64 ^ {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          if (strchr(insn.opcode->name, '.'))
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 31a86cd..75e7775 100644
+index 31a86cd..03eb25e 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
-@@ -115,6 +115,12 @@
+@@ -115,6 +115,15 @@
  
  typedef void PPCFunc(struct PPCContext& __restrict__ ctx, uint8_t* base);
  
@@ -195,6 +205,9 @@ index 31a86cd..75e7775 100644
 +
 +// Ikaruga : écriture du MSR (mtmsrd) ; le runtime suit le bit EE pour sérialiser les interruptions par CPU
 +void GuestWriteMsr(struct PPCContext& ctx, uint64_t value);
++
++// Ikaruga : exécute les interruptions en attente pour le CPU de ce thread (attentes actives, db16cyc)
++void GuestPollInterrupts(struct PPCContext& ctx);
 +
  struct PPCFuncMapping
  {

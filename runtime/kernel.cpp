@@ -12,6 +12,9 @@
 #include <unordered_map>
 #include <vector>
 
+void InterruptsRegisterThread(PPCContext& ctx);
+void InterruptsPollCurrent();
+
 #define KFUNC(name) PPC_FUNC(__imp__##name)
 #define ARG(n) ctx.r##n.u32
 #define RET(v) do { ctx.r3.u64 = (uint32_t)(v); return; } while (0)
@@ -134,6 +137,9 @@ struct KGuestDispatcher : KObject
             if (TryAcquire()) return true;
             if (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline) return false;
             s_dispatchCv.wait_for(lock, std::chrono::milliseconds(2));
+            lock.unlock();
+            InterruptsPollCurrent();   // un thread qui attend reste interruptible
+            lock.lock();
         }
     }
     void Signal() override
@@ -322,8 +328,9 @@ static bool WaitLogged(KObject& o, int64_t timeoutMs, const char* what, uint32_t
     if (timeoutMs >= 0) return o.Wait(timeoutMs);
     for (int slices = 0;; slices++)
     {
-        if (o.Wait(2000)) return true;
-        if (slices == 0) KLOG("attente longue : %s %08X (retour vers %08X)", what, id, lr);
+        if (o.Wait(2)) return true;
+        InterruptsPollCurrent();
+        if (slices == 1000) KLOG("attente longue : %s %08X (retour vers %08X)", what, id, lr);
     }
 }
 
@@ -359,6 +366,7 @@ static uint32_t WaitMultiple(std::vector<std::shared_ptr<KObject>> objs, bool wa
             if (logged++ < 5) KLOG("attente longue : %zu objets (tous=%d)", objs.size(), waitAll);
             start = std::chrono::steady_clock::now() + std::chrono::hours(1000);
         }
+        InterruptsPollCurrent();
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
 }
@@ -412,6 +420,7 @@ static void ThreadMain(std::shared_ptr<KThread> t)
         t->suspendCv.wait(l, [&] { return !t->suspended; });
     }
     PPCContext& ctx = t->ctx;
+    InterruptsRegisterThread(ctx);
     {
         char name[32]; snprintf(name, sizeof name, "thread %08X", t->startCtx ? t->startCtx : t->startAddr);
         DebugRegisterThread(name);
@@ -839,6 +848,9 @@ void GpuEnableReadPointerWriteBack(uint32_t addr);
 void GpuSetInterruptCallback(uint32_t cb, uint32_t ctx);
 void GpuOnSwap();
 extern std::recursive_mutex g_interruptMutex;
+bool InterruptsDeliver(uint32_t cpu, uint32_t callback, uint32_t source, uint32_t arg);
+void InterruptsRegisterThread(PPCContext& ctx);
+void InterruptsPollCurrent();
 std::recursive_mutex& GuestCpuLock(uint32_t cpu);
 void VulkanPresent(float r, float g, float b);
 void GpuPrintStats();
@@ -865,6 +877,7 @@ KFUNC(VdSetGraphicsInterruptCallback)
                 if (uint32_t cb = s_gfxCallback)
                 {
                     std::lock_guard lock(g_interruptMutex);   // sérialisé avec les interruptions du GPU
+                    if (InterruptsDeliver(2, cb, 0, s_gfxCallbackCtx)) continue;   // exécutée sur le CPU 2
                     std::lock_guard cpuLock(GuestCpuLock(2));
                     Wr8(ctx.r13.u32 + 0x10C, 2);   // Xenia livre le vblank sur le processeur 2
                     ctx.r3.u64 = 0;   // source : vblank
@@ -1043,4 +1056,5 @@ void GuestWriteMsr(PPCContext& ctx, uint64_t value)
     if (wasEnabled && !enabled) s_cpuLocks[cpu].lock();
     else if (!wasEnabled && enabled) s_cpuLocks[cpu].unlock();
     ctx.msr = value;
+    if (!wasEnabled && enabled) GuestPollInterrupts(ctx);
 }
