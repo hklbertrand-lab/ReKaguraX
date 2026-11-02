@@ -654,6 +654,19 @@ KFUNC(NtReadFile)   // (handle, event, apc, apcCtx, iosb, buffer, length, pOffse
     size_t n = fread(g_base + ARG(8), 1, ARG(9), file->f);
     Wr32(ARG(7), n ? STATUS_SUCCESS : STATUS_END_OF_FILE); Wr32(ARG(7) + 4, (uint32_t)n);
     if (ARG(4)) if (auto ev = FromHandle(ARG(4))) ev->Signal();
+    // Débogage : IKARUGA_IOSTACK=nom -> pile invitée (cadres PowerPC : chaînage en [r1], LR sauvé en -8)
+    if (const char* want = getenv("IKARUGA_IOSTACK"); want && file->path.filename().string() == want)
+    {
+        std::string chain;
+        uint32_t sp = ctx.r1.u32;
+        for (int i = 0; i < 14 && sp; i++)
+        {
+            sp = Rd32(sp);
+            if (!sp) break;
+            char b[12]; snprintf(b, sizeof b, " %08X", Rd32(sp - 8)); chain += b;
+        }
+        KLOG("pile lecture %s (%u octets, lr %08X) :%s", want, ARG(9), uint32_t(ctx.lr), chain.c_str());
+    }
     static int logged;
     if (getenv("IKARUGA_IOLOG") && logged++ < 4000)
         KLOG("NtReadFile %s : %u octets à %lld -> %zu (event %08X, apc %08X, ctx %08X)", file->path.filename().string().c_str(),

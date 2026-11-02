@@ -24,8 +24,9 @@ struct XmaContext
 {
     bool used = false, enabled = false;
     AVCodecContext* codec = nullptr;
-    int channels = 0;
+    int channels = 0, rate = 0;
     std::vector<uint8_t> pending;   // PCM décodé pas encore écrit dans l'anneau de sortie
+    uint64_t produced = 0, sent = 0, errors = 0;   // statistiques (IKARUGA_XMALOG)
 };
 
 static std::mutex s_mutex;
@@ -116,21 +117,23 @@ void ApuReleaseContext(uint32_t ptr)
 
 // ---------------------------------------------------------------- décodage
 
-static bool OpenCodec(XmaContext& c, int channels)
+// La fréquence compte : le décodeur WMA Pro en déduit le découpage en bandes (à 48 kHz, un flux 24 kHz
+// est rejeté paquet après paquet)
+static bool OpenCodec(XmaContext& c, int channels, int rate)
 {
-    if (c.codec && c.channels == channels) return true;
+    if (c.codec && c.channels == channels && c.rate == rate) return true;
     if (c.codec) avcodec_free_context(&c.codec);
     const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
     c.codec = avcodec_alloc_context3(codec);
     av_channel_layout_default(&c.codec->ch_layout, channels);
-    c.codec->sample_rate = 48000;   // sans effet sur le décodage, la cadence vient du mixeur du jeu
+    c.codec->sample_rate = rate;
     c.codec->block_align = kPacketBytes;
     // XMA2WAVEFORMATEX réduit : 1 flux, masque de canaux 0 (disposition par défaut)
     c.codec->extradata = (uint8_t*)av_mallocz(34 + AV_INPUT_BUFFER_PADDING_SIZE);
     c.codec->extradata_size = 34;
     c.codec->extradata[0] = 1;
     if (avcodec_open2(c.codec, codec, nullptr) < 0) { KLOG("XMA : ouverture du décodeur impossible"); avcodec_free_context(&c.codec); return false; }
-    c.channels = channels;
+    c.channels = channels; c.rate = rate;
     return true;
 }
 
@@ -139,9 +142,17 @@ static void DecodePacket(XmaContext& c, const uint8_t* data)
 {
     s_packet->data = const_cast<uint8_t*>(data);
     s_packet->size = kPacketBytes;
-    if (avcodec_send_packet(c.codec, s_packet) < 0) return;
+    c.sent++;
+    if (int err = avcodec_send_packet(c.codec, s_packet); err < 0)
+    {
+        c.errors++;
+        static int n;
+        if (s_log && n++ < 10) { char msg[64]; av_strerror(err, msg, sizeof msg); KLOG("XMA : paquet refusé (%d : %s), %d canaux, en-tête %02X%02X%02X%02X", err, msg, c.channels, data[0], data[1], data[2], data[3]); }
+        return;
+    }
     while (avcodec_receive_frame(c.codec, s_frame) == 0)
     {
+        c.produced += s_frame->nb_samples;
         int n = s_frame->nb_samples, ch = c.channels;
         size_t at = c.pending.size();
         c.pending.resize(at + size_t(n) * ch * 2);
@@ -167,13 +178,14 @@ static void ProcessContext(uint32_t id)
     uint32_t blockCount = (d0 >> 22) & 0x1F, writeBlock = d0 >> 27, readBlock = d9 & 0x1F;
     if (!blockCount) return;
     int channels = ((d1 >> 29) & 1) ? 2 : 1;
-    if (!OpenCodec(c, channels)) { c.enabled = false; return; }
+    static const int rates[4] = { 24000, 32000, 44100, 48000 };
+    if (!OpenCodec(c, channels, rates[(d1 >> 27) & 3])) { c.enabled = false; return; }
     uint32_t out = 0xA0000000 | (Rd32(a + 28) & 0x1FFFFFFF);
-    uint32_t loopCount = (d0 >> 12) & 0xFF;
-    static bool warnedLoop;
-    if (loopCount && !warnedLoop) { warnedLoop = true; KLOG("XMA : boucles matérielles (loop_count %u) non gérées", loopCount); }
+    // Boucle matérielle : loop_start (d3) et loop_end (d4) en bits depuis le début du tampon ; 255 = infinie.
+    // Approximation au paquet près : après le paquet contenant loop_end on reprend à celui de loop_start.
+    uint32_t loopStart = Rd32(a + 12) & 0x3FFFFFF;
 
-    for (;;)
+    for (int budget = 64; budget > 0; )   // paquets décodés au plus par passage (le verrou reste court)
     {
         // Place libre en blocs (un bloc reste vide : anneau plein et anneau vide ne se confondent pas)
         uint32_t freeBlocks = (readBlock + blockCount - writeBlock - 1) % blockCount;
@@ -197,7 +209,12 @@ static void ProcessContext(uint32_t id)
         if (!valid)
         {
             bool other = current ? valid0 : valid1;
-            if (!other) break;   // plus rien à décoder
+            if (!other)
+            {
+                static uint32_t lastDry[kContextCount];
+                if (s_log && lastDry[id] != d2) { lastDry[id] = d2; KLOG("XMA : contexte %u à sec (d0=%08X d2=%08X d4=%08X)", id, d0, d2, d4); }
+                break;   // plus rien à décoder
+            }
             current ^= 1;
             d4 = (d4 & 0x7FFFFFFF) | (current << 31);
             d2 = (d2 & ~0x3FFFFFFu) | 32;
@@ -208,6 +225,7 @@ static void ProcessContext(uint32_t id)
         uint32_t index = (d2 & 0x3FFFFFF) / (kPacketBytes * 8);
         if (index >= packets)
         {
+            if (s_log) KLOG("XMA : contexte %u tampon %u épuisé (%u paquets) ; d0=%08X d1=%08X loop=%08X/%08X autre valide=%d", id, current, packets, d0, d1, Rd32(a + 12), d4, current ? valid0 : valid1);
             // Tampon épuisé : invalidé, on passe à l'autre
             d0 &= ~(1u << (20 + current));
             current ^= 1;
@@ -216,6 +234,19 @@ static void ProcessContext(uint32_t id)
             continue;
         }
         DecodePacket(c, g_base + (0xA0000000 | (base + index * kPacketBytes)));
+        budget--;
+        uint32_t loopCount = (d0 >> 12) & 0xFF, loopEnd = d4 & 0x3FFFFFF;
+        if (loopCount && loopEnd > loopStart && index == loopEnd / (kPacketBytes * 8) && loopStart / (kPacketBytes * 8) < index)
+        {
+            if (loopCount != 255) d0 = (d0 & ~(0xFFu << 12)) | ((loopCount - 1) << 12);
+            uint32_t to = loopStart / (kPacketBytes * 8);
+            if (s_log) { static int n; if (n++ < 30) KLOG("XMA : contexte %u boucle paquet %u -> %u (reste %u) ; paquets %llu, erreurs %llu, échantillons %llu",
+                id, index, to, loopCount, (unsigned long long)c.sent, (unsigned long long)c.errors, (unsigned long long)c.produced); c.sent = c.errors = c.produced = 0; }
+            d2 = (d2 & ~0x3FFFFFFu) | (to * kPacketBytes * 8 + 32);
+            // Pas de avcodec_flush_buffers : après un vidage le décodeur xma2 ne produit plus rien ; il se
+            // resynchronise seul sur le début de trame indiqué dans l'en-tête du paquet
+            continue;
+        }
         static uint64_t decoded;
         if (s_log && ++decoded % 200 == 1) KLOG("XMA : %llu paquets décodés (contexte %u, %d canaux, %u paquets dans le tampon %u)", (unsigned long long)decoded, id, channels, packets, current);
         d2 = (d2 & ~0x3FFFFFFu) | ((index + 1) * kPacketBytes * 8 + 32);
@@ -223,7 +254,8 @@ static void ProcessContext(uint32_t id)
     d0 = (d0 & ~(0x1Fu << 27)) | (writeBlock << 27);
     // Le jeu a pu modifier le contexte entre-temps (hors verrou) : on ne réécrit que nos champs
     uint32_t n0 = Rd32(a), n2 = Rd32(a + 8), n4 = Rd32(a + 16);
-    Wr32(a, (n0 & ~((0x1Fu << 27) | (3u << 20))) | (d0 & ((0x1Fu << 27) | (3u << 20))));
+    uint32_t mine = (0x1Fu << 27) | (3u << 20) | (0xFFu << 12);
+    Wr32(a, (n0 & ~mine) | (d0 & mine));
     Wr32(a + 8, (n2 & ~0x3FFFFFFu) | (d2 & 0x3FFFFFF));
     Wr32(a + 16, (n4 & 0x7FFFFFFF) | (d4 & 0x80000000));
 }

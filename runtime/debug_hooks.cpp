@@ -165,34 +165,3 @@ PPC_FUNC(sub_82170FB8)
     __imp__sub_82170FB8(ctx, base);
 }
 
-// Chaîne audio : callback XAudio -> réveil du thread de mixage -> soumission (IKARUGA_XMALOG)
-static void CountCall(const char* what, uint32_t r3)
-{
-    static bool log = getenv("IKARUGA_XMALOG");
-    static std::unordered_map<std::string, uint64_t> counts;
-    static std::mutex m;
-    if (!log) return;
-    std::lock_guard l(m);
-    uint64_t n = ++counts[what];
-    if (n <= 3 || n % 500 == 0) KLOG("audio : %s n°%llu (r3=%08X)", what, (unsigned long long)n, r3);
-}
-extern "C" PPC_FUNC(__imp__sub_824BDD18);
-PPC_FUNC(sub_824BDD18) { CountCall("callback", ctx.r3.u32); __imp__sub_824BDD18(ctx, base); }
-extern "C" PPC_FUNC(__imp__sub_824A65E8);
-PPC_FUNC(sub_824A65E8) { CountCall("mixage 824A65E8", ctx.r3.u32); __imp__sub_824A65E8(ctx, base); }
-extern "C" PPC_FUNC(__imp__sub_8249DEF8);
-PPC_FUNC(sub_8249DEF8) { CountCall("soumission 8249DEF8", ctx.r3.u32); __imp__sub_8249DEF8(ctx, base); }
-extern "C" PPC_FUNC(__imp__sub_824A06E0);
-PPC_FUNC(sub_824A06E0) { __imp__sub_824A06E0(ctx, base); CountCall(int32_t(ctx.r3.u32) < 0 ? "824A06E0 échec" : "824A06E0 ok", ctx.r3.u32); }
-extern "C" PPC_FUNC(__imp__sub_824A80E0);
-PPC_FUNC(sub_824A80E0) { CountCall("XMA lancement 824A80E0", ctx.r3.u32); __imp__sub_824A80E0(ctx, base); }
-extern "C" PPC_FUNC(__imp__sub_824A7790);
-PPC_FUNC(sub_824A7790) { __imp__sub_824A7790(ctx, base); CountCall("XMA verrou 824A7790 -> r3", ctx.r3.u32); }
-extern "C" PPC_FUNC(__imp__sub_824A7F90);
-PPC_FUNC(sub_824A7F90) { __imp__sub_824A7F90(ctx, base); CountCall("XMA 824A7F90 -> r3", ctx.r3.u32); }
-extern "C" PPC_FUNC(__imp__sub_824A3968);
-PPC_FUNC(sub_824A3968) { CountCall("voix 824A3968", ctx.r3.u32); __imp__sub_824A3968(ctx, base); }
-extern "C" PPC_FUNC(__imp__sub_824A7658);
-PPC_FUNC(sub_824A7658) { __imp__sub_824A7658(ctx, base); CountCall("XMA 824A7658 -> r3", ctx.r3.u32); }
-extern "C" PPC_FUNC(__imp__sub_824A2630);
-PPC_FUNC(sub_824A2630) { CountCall("voix 824A2630", ctx.r3.u32); __imp__sub_824A2630(ctx, base); }
