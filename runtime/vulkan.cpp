@@ -294,38 +294,65 @@ void VulkanPresentFrame(VkImage src, uint32_t width, uint32_t height)
         vkCmdBlitImage(s_cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     }
 
-    // Menu de réglages : pixels BGRA dessinés par SDL, copiés au centre (un tampon par image en vol)
-    static VkBuffer menuBuf[kFrames];
-    static uint32_t* menuPixels[kFrames];
-    if (!menuBuf[s_cur])
-    {
-        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bci.size = kMenuWidth * kMenuHeight * 4;
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        vkCreateBuffer(s_device, &bci, nullptr, &menuBuf[s_cur]);
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(s_device, menuBuf[s_cur], &req);
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        VkDeviceMemory mem;
-        vkAllocateMemory(s_device, &mai, nullptr, &mem);
-        vkBindBufferMemory(s_device, menuBuf[s_cur], mem, 0);
-        vkMapMemory(s_device, mem, 0, VK_WHOLE_SIZE, 0, (void**)&menuPixels[s_cur]);
-    }
-    if (s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM && s_extent.width >= uint32_t(kMenuWidth) && s_extent.height >= uint32_t(kMenuHeight) &&
-        MenuRender(menuPixels[s_cur], kMenuWidth, kMenuHeight))
-    {
-        // Le blit de l'image du jeu écrit la même zone : il doit être terminé avant la copie
-        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    // Surimpressions (menu de réglages, compteur FPS) : pixels BGRA dessinés par SDL dans un tampon visible du CPU
+    // (un par image en vol), copiés sur l'image de la swapchain après le blit du jeu
+    struct Overlay { VkBuffer buf[kFrames]; uint32_t* pixels[kFrames]; };
+    static Overlay menu{}, fps{};
+    auto pixelsOf = [](Overlay& o, uint32_t w, uint32_t h) {
+        if (!o.buf[s_cur])
+        {
+            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+            bci.size = VkDeviceSize(w) * h * 4;
+            bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            vkCreateBuffer(s_device, &bci, nullptr, &o.buf[s_cur]);
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(s_device, o.buf[s_cur], &req);
+            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkDeviceMemory mem;
+            vkAllocateMemory(s_device, &mai, nullptr, &mem);
+            vkBindBufferMemory(s_device, o.buf[s_cur], mem, 0);
+            vkMapMemory(s_device, mem, 0, VK_WHOLE_SIZE, 0, (void**)&o.pixels[s_cur]);
+        }
+        return o.pixels[s_cur];
+    };
+    bool barrierDone = false;
+    auto copyOverlay = [&](Overlay& o, int32_t x, int32_t y, uint32_t w, uint32_t h) {
+        if (!barrierDone)
+        {
+            // Le blit de l'image du jeu écrit la même zone : il doit être terminé avant la copie
+            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            barrierDone = true;
+        }
         VkBufferImageCopy c{};
         c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        c.imageOffset = { int32_t(s_extent.width - kMenuWidth) / 2, int32_t(s_extent.height - kMenuHeight) / 2, 0 };
-        c.imageExtent = { uint32_t(kMenuWidth), uint32_t(kMenuHeight), 1 };
-        vkCmdCopyBufferToImage(s_cmd, menuBuf[s_cur], s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        c.imageOffset = { x, y, 0 };
+        c.imageExtent = { w, h, 1 };
+        vkCmdCopyBufferToImage(s_cmd, o.buf[s_cur], s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    };
+    // Images par seconde du jeu (présentations), moyennées sur une demi-seconde
+    static auto fpsStart = std::chrono::steady_clock::now();
+    static uint32_t fpsFrames;
+    static float fpsValue = 60;
+    fpsFrames++;
+    if (double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - fpsStart).count(); dt >= 0.5)
+    {
+        fpsValue = float(fpsFrames / dt);
+        fpsFrames = 0;
+        fpsStart = std::chrono::steady_clock::now();
+    }
+    if (s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM)
+    {
+        if (s_extent.width >= uint32_t(kFpsWidth + 16) && s_extent.height >= uint32_t(kFpsHeight + 16) &&
+            FpsRender(pixelsOf(fps, kFpsWidth, kFpsHeight), kFpsWidth, kFpsHeight, fpsValue))
+            copyOverlay(fps, 8, 8, kFpsWidth, kFpsHeight);
+        if (s_extent.width >= uint32_t(kMenuWidth) && s_extent.height >= uint32_t(kMenuHeight) &&
+            MenuRender(pixelsOf(menu, kMenuWidth, kMenuHeight), kMenuWidth, kMenuHeight))
+            copyOverlay(menu, int32_t(s_extent.width - kMenuWidth) / 2, int32_t(s_extent.height - kMenuHeight) / 2, kMenuWidth, kMenuHeight);
     }
     static uint64_t shotFrame = getenv("IKARUGA_SHOT") ? strtoull(getenv("IKARUGA_SHOT"), nullptr, 10) : 0;
     VkBuffer shotBuf = VK_NULL_HANDLE; VkDeviceMemory shotMem = VK_NULL_HANDLE;

@@ -13,18 +13,21 @@ extern SDL_Window* g_window;
 
 static const char* kFile = "ikaruga.ini";
 static const struct { const char* name; int w, h; } kResolutions[] = {
-    { "1280x720 (d'origine)", 1280, 720 }, { "1280x800", 1280, 800 }, { "2560x1440", 2560, 1440 }, { "3840x2160 (4K)", 3840, 2160 } };
+    { "1280x720 (d'origine)", 1280, 720 }, { "1280x800", 1280, 800 }, { "1920x1080", 1920, 1080 },
+    { "2560x1440", 2560, 1440 }, { "3840x2160 (4K)", 3840, 2160 } };
+static constexpr int kResolutionCount = int(sizeof(kResolutions) / sizeof(kResolutions[0]));
+static int Res(int index) { return std::clamp(index, 0, kResolutionCount - 1); }
 
-const char* SettingsResolutionName(int index) { return kResolutions[index & 3].name; }
+const char* SettingsResolutionName(int index) { return kResolutions[Res(index)].name; }
 
 void SettingsWindowSize(int& w, int& h)
 {
-    w = kResolutions[g_settings.resolution & 3].w;
-    h = kResolutions[g_settings.resolution & 3].h;
+    w = kResolutions[Res(g_settings.resolution)].w;
+    h = kResolutions[Res(g_settings.resolution)].h;
 }
 
 // Le jeu calcule en 720 lignes : le facteur suit la hauteur choisie
-float SettingsScale() { return kResolutions[g_settings.resolution & 3].h / 720.0f; }
+float SettingsScale() { return kResolutions[Res(g_settings.resolution)].h / 720.0f; }
 
 static std::atomic<bool> s_open;
 
@@ -37,7 +40,14 @@ void SettingsLoad()
     while (fgets(line, sizeof line, f))
     {
         int v;
-        if (sscanf(line, "resolution = %d", &v) == 1) g_settings.resolution = v & 3;
+        if (sscanf(line, "resolution = %d", &v) == 1)
+        {
+            // hauteur en pixels ; anciens fichiers : indice 0-3 de la liste sans 1080p
+            static const int legacy[4] = { 0, 1, 3, 4 };
+            if (v >= 0 && v < 4) g_settings.resolution = legacy[v];
+            else for (int i = 0; i < kResolutionCount; i++) if (kResolutions[i].h == v) g_settings.resolution = i;
+        }
+        else if (sscanf(line, "fps = %d", &v) == 1) g_settings.showFps = v != 0;
         else if (sscanf(line, "fullscreen = %d", &v) == 1) g_settings.fullscreen = v != 0;
         else if (sscanf(line, "wide = %d", &v) == 1) g_settings.wide = v != 0;
     }
@@ -48,15 +58,16 @@ void SettingsSave()
 {
     FILE* f = fopen(kFile, "w");
     if (!f) return;
-    fprintf(f, "# Ikaruga : réglages (F1 en jeu)\n# resolution : 0 = 1280x720, 1 = 1280x800, 2 = 2560x1440, 3 = 3840x2160\n");
-    fprintf(f, "resolution = %d\nfullscreen = %d\nwide = %d\n", g_settings.resolution.load(), g_settings.fullscreen ? 1 : 0, g_settings.wide ? 1 : 0);
+    fprintf(f, "# Ikaruga : réglages (F1 en jeu)\n# resolution : hauteur (720, 800, 1080, 1440, 2160)\n");
+    fprintf(f, "resolution = %d\nfullscreen = %d\nwide = %d\nfps = %d\n", kResolutions[Res(g_settings.resolution)].h,
+        g_settings.fullscreen ? 1 : 0, g_settings.wide ? 1 : 0, g_settings.showFps ? 1 : 0);
     fclose(f);
 }
 
 // ---------------------------------------------------------------- menu
 
 static std::atomic<int> s_selected;
-enum { ITEM_RESOLUTION, ITEM_FULLSCREEN, ITEM_WIDE, ITEM_CLOSE, ITEM_COUNT };
+enum { ITEM_RESOLUTION, ITEM_FULLSCREEN, ITEM_WIDE, ITEM_FPS, ITEM_CLOSE, ITEM_COUNT };
 
 bool MenuOpen() { return s_open; }
 
@@ -85,9 +96,10 @@ static void Change(int item, int dir)
 {
     switch (item)
     {
-    case ITEM_RESOLUTION: g_settings.resolution = (g_settings.resolution + dir + 4) & 3; ApplyWindow(); break;
+    case ITEM_RESOLUTION: g_settings.resolution = (Res(g_settings.resolution) + dir + kResolutionCount) % kResolutionCount; ApplyWindow(); break;
     case ITEM_FULLSCREEN: g_settings.fullscreen = !g_settings.fullscreen; ApplyWindow(); break;
     case ITEM_WIDE: g_settings.wide = !g_settings.wide; break;
+    case ITEM_FPS: g_settings.showFps = !g_settings.showFps; break;
     case ITEM_CLOSE: s_open = false; break;
     }
     SettingsSave();
@@ -129,6 +141,7 @@ bool MenuRender(uint32_t* pixels, int width, int height)
     snprintf(lines[ITEM_RESOLUTION], 64, "Resolution   < %s >", SettingsResolutionName(g_settings.resolution));
     snprintf(lines[ITEM_FULLSCREEN], 64, "Plein ecran  < %s >", g_settings.fullscreen ? "oui" : "non");
     snprintf(lines[ITEM_WIDE], 64, "Mode large   < %s >", g_settings.wide ? "oui (exp.)" : "non");
+    snprintf(lines[ITEM_FPS], 64, "Afficher FPS < %s >", g_settings.showFps ? "oui" : "non");
     snprintf(lines[ITEM_CLOSE], 64, "Fermer");
     for (int i = 0; i < ITEM_COUNT; i++)
     {
@@ -143,8 +156,31 @@ bool MenuRender(uint32_t* pixels, int width, int height)
         SDL_RenderDebugText(r, 12, y, lines[i]);
     }
     SDL_SetRenderDrawColor(r, 140, 140, 150, 255);
-    SDL_RenderDebugText(r, 12, 94, "Fleches : choisir/changer  Echap : fermer");
-    SDL_RenderDebugText(r, 12, 104, "F1 : menu   F11 / Alt+Entree : plein ecran");
+    SDL_RenderDebugText(r, 12, 108, "Fleches : choisir/changer  Echap : fermer");
+    SDL_RenderDebugText(r, 12, 118, "F1 : menu   F11 / Alt+Entree : plein ecran");
+    SDL_RenderPresent(r);
+    SDL_DestroyRenderer(r);
+    SDL_DestroySurface(surface);
+    return true;
+}
+
+bool FpsRender(uint32_t* pixels, int width, int height, float fps)
+{
+    if (!g_settings.showFps) return false;
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_ARGB8888, pixels, width * 4);
+    if (!surface) return false;
+    SDL_Renderer* r = SDL_CreateSoftwareRenderer(surface);
+    if (!r) { SDL_DestroySurface(surface); return false; }
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
+    SDL_RenderClear(r);
+    SDL_SetRenderScale(r, 2, 2);
+    // vert à 60, jaune au-dessous de 58, rouge au-dessous de 50
+    if (fps >= 58) SDL_SetRenderDrawColor(r, 120, 230, 120, 255);
+    else if (fps >= 50) SDL_SetRenderDrawColor(r, 240, 210, 90, 255);
+    else SDL_SetRenderDrawColor(r, 240, 90, 80, 255);
+    char text[32];
+    snprintf(text, sizeof text, "%5.1f FPS", fps);
+    SDL_RenderDebugText(r, 6, 3, text);
     SDL_RenderPresent(r);
     SDL_DestroyRenderer(r);
     SDL_DestroySurface(surface);

@@ -5,9 +5,10 @@
 
 struct Settings
 {
-    std::atomic<int> resolution{ 0 };     // 0 = 720p, 1 = 1280x800, 2 = 1440p, 3 = 4K (rendu interne et fenêtre)
+    std::atomic<int> resolution{ 0 };     // 0 = 720p, 1 = 1280x800, 2 = 1080p, 3 = 1440p, 4 = 4K (rendu interne et fenêtre)
     std::atomic<bool> fullscreen{ false };
     std::atomic<bool> wide{ false };      // mode large expérimental : vue 3D élargie, panneaux latéraux masqués
+    std::atomic<bool> showFps{ false };   // compteur d'images par seconde en haut à gauche
 };
 extern Settings g_settings;
 
@@ -22,5 +23,8 @@ bool MenuOpen();
 bool MenuHandleKey(int scancode);          // true si la touche a été consommée
 // Dessine le menu dans des pixels BGRA (largeur x hauteur fixes) ; renvoie false si rien à afficher
 bool MenuRender(uint32_t* pixels, int width, int height);
-constexpr int kMenuWidth = 720, kMenuHeight = 240;
+constexpr int kMenuWidth = 720, kMenuHeight = 270;
+// Compteur d'images par seconde (même principe que le menu)
+bool FpsRender(uint32_t* pixels, int width, int height, float fps);
+constexpr int kFpsWidth = 176, kFpsHeight = 28;
 void SettingsApplyWindow();               // applique plein écran et taille de fenêtre (thread principal)
