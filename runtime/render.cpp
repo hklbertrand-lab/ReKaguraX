@@ -4,6 +4,7 @@
 // cette adresse utilise directement cette image (pas de relecture par le CPU), et VdSwap présente celle
 // du tampon d'affichage.
 #include "render.h"
+#include "settings.h"
 #include "guest.h"
 #include "shaders.h"
 #include "vulkan.h"
@@ -35,6 +36,12 @@ enum : uint32_t
 };
 
 static constexpr uint32_t kTargetHeight = 1024;   // hauteur des cibles (l'EDRAM n'en fixe pas)
+
+// Rendu interne : les cibles, viewports, scissors et copies sont multipliés par s_scale (1 = 720p d'origine).
+// Les adresses, pas et tuiles restent en coordonnées du jeu.
+static float s_scale = 1.0f;
+static inline uint32_t S(uint32_t v) { return uint32_t(v * s_scale + 0.5f); }
+static inline int32_t S(int32_t v) { return int32_t(v * s_scale + (v >= 0 ? 0.5f : -0.5f)); }
 static constexpr VkDeviceSize kUploadSize = 64 << 20;
 
 struct Image
@@ -47,9 +54,10 @@ static bool s_ready;
 static VkDevice s_dev;
 static Image s_white;
 
-struct ColorTarget { Image image; VkFormat format; uint32_t width, height; };
-struct DepthTarget { Image image; uint32_t width, height; };
-struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0, bpp = 4; };
+// width/height : taille côté jeu ; hw/hh : taille réelle de l'image (rendu interne mis à l'échelle)
+struct ColorTarget { Image image; VkFormat format; uint32_t width, height, hw, hh; };
+struct DepthTarget { Image image; uint32_t width, height, hw, hh; };
+struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0, bpp = 4, hw = 0, hh = 0; };
 struct TextureFormatInfo { VkFormat vk; uint32_t blockSize, bytesPerBlock; };
 static TextureFormatInfo TextureFormat(uint32_t fmt);
 static std::unordered_map<uint64_t, ColorTarget> s_colorTargets;       // (base EDRAM, format, pitch)
@@ -106,7 +114,7 @@ static VkDeviceMemory Allocate(VkMemoryRequirements req, VkMemoryPropertyFlags f
 // Mémoire des images : sous-allocation linéaire dans des blocs de 64 Mo par type de mémoire (les images ne sont
 // jamais libérées). Un vkAllocateMemory par texture coûtait ~1 ms : 30 nouvelles textures dans une image (explosions,
 // ennemis qui apparaissent) faisaient rater 2 ou 3 vblanks.
-static void BindImageMemory(VkImage image)
+static VkDeviceMemory BindImageMemory(VkImage image)
 {
     struct Block { VkDeviceMemory memory; VkDeviceSize used, size; };
     static std::unordered_map<uint32_t, Block> blocks;   // type de mémoire -> bloc courant
@@ -116,8 +124,9 @@ static void BindImageMemory(VkImage image)
     uint32_t type = VulkanFindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (req.size > kBlock / 4)   // très grande image : allocation dédiée
     {
-        vkBindImageMemory(s_dev, image, Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), 0);
-        return;
+        VkDeviceMemory mem = Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkBindImageMemory(s_dev, image, mem, 0);
+        return mem;   // dédiée : libérée quand l'échelle change
     }
     Block& b = blocks[type];
     VkDeviceSize at = (b.used + req.alignment - 1) & ~(req.alignment - 1);
@@ -130,6 +139,7 @@ static void BindImageMemory(VkImage image)
     }
     vkBindImageMemory(s_dev, image, b.memory, at);
     b.used = at + req.size;
+    return VK_NULL_HANDLE;
 }
 
 static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,
@@ -149,7 +159,7 @@ static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage, VkForm
     vkCreateImage(s_dev, &ci, nullptr, &img.image);
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(s_dev, img.image, &req);
-    BindImageMemory(img.image);
+    img.memory = BindImageMemory(img.image);
     VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     vi.image = img.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -251,6 +261,29 @@ static bool Init()
     return true;
 }
 
+// Changement de résolution interne : toutes les cibles et copies sont recréées à la nouvelle taille au fil des
+// dessins. Appelé en début d'image, avant tout enregistrement ; les grandes images (allocation dédiée) sont libérées.
+static void RebuildForScale(float scale)
+{
+    vkDeviceWaitIdle(s_dev);
+    auto destroy = [](Image& img) {
+        if (img.view) vkDestroyImageView(s_dev, img.view, nullptr);
+        if (img.image) vkDestroyImage(s_dev, img.image, nullptr);
+        if (img.memory) vkFreeMemory(s_dev, img.memory, nullptr);
+        img = {};
+    };
+    for (auto& [k, fb] : s_framebuffers) vkDestroyFramebuffer(s_dev, fb, nullptr);
+    s_framebuffers.clear();
+    for (auto& [k, t] : s_colorTargets) destroy(t.image);
+    for (auto& [k, t] : s_depthTargets) destroy(t.image);
+    s_colorTargets.clear();
+    s_depthTargets.clear();
+    for (auto& [k, r] : s_resolved) destroy(r.image);   // descripteur conservé : réécrit à la recréation
+    s_curColor = nullptr; s_curDepth = nullptr; s_presented = nullptr;
+    KLOG("rendu : résolution interne x%.2f", scale);
+    s_scale = scale;
+}
+
 // Command buffer de l'image en cours ; au premier appel d'une image, réinitialise le tampon d'envoi
 static bool BeginCommands()
 {
@@ -258,6 +291,7 @@ static bool BeginCommands()
     s_cmd = VulkanFrameCmd();
     if (!s_frameStarted)
     {
+        if (float want = SettingsScale(); want != s_scale) RebuildForScale(want);
         s_frameStarted = true;
         s_frameId++;
         s_uploadBegin = s_uploadOffset = VulkanFrameSlot() * (kUploadSize / 2);
@@ -367,7 +401,8 @@ static ColorTarget& GetColorTarget(const uint32_t* regs)
         t.format = ColorFormat(format);
         t.width = width;
         t.height = kTargetHeight;
-        t.image = CreateImage(width, kTargetHeight, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, t.format);
+        t.hw = S(width); t.hh = S(kTargetHeight);
+        t.image = CreateImage(t.hw, t.hh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, t.format);
         VkClearColorValue black{};
         VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         Transition(t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -386,7 +421,8 @@ static DepthTarget& GetDepthTarget(const uint32_t* regs, uint32_t width, uint32_
     {
         EndRenderPass();
         t.width = width; t.height = height;
-        t.image = CreateImage(width, height, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        t.hw = S(width); t.hh = S(height);
+        t.image = CreateImage(t.hw, t.hh, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
         VkClearDepthStencilValue clear{ 1.0f, 0 };
         VkImageSubresourceRange range{ VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
@@ -415,8 +451,8 @@ static void BeginTargets(const uint32_t* regs)
         ci.renderPass = rp;
         ci.attachmentCount = 2;
         ci.pAttachments = views;
-        ci.width = color.width;
-        ci.height = color.height;
+        ci.width = color.hw;
+        ci.height = color.hh;
         ci.layers = 1;
         vkCreateFramebuffer(s_dev, &ci, nullptr, &fb);
     }
@@ -425,7 +461,7 @@ static void BeginTargets(const uint32_t* regs)
     VkRenderPassBeginInfo rb{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rb.renderPass = rp;
     rb.framebuffer = fb;
-    rb.renderArea = { { 0, 0 }, { color.width, color.height } };
+    rb.renderArea = { { 0, 0 }, { color.hw, color.hh } };
     vkCmdBeginRenderPass(s_cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
     s_inRenderPass = true;
 }
@@ -696,8 +732,8 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
         Resolved& r = s_resolved[key];
         if (!r.image.image || r.width != w || r.height != h || r.format != VK_FORMAT_R32_SFLOAT)
         {
-            r.image = CreateImage(w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_R32_SFLOAT);
-            r.width = w; r.height = h; r.format = VK_FORMAT_R32_SFLOAT; r.bpp = bpp;
+            r.image = CreateImage(S(w), S(h), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_R32_SFLOAT);
+            r.width = w; r.height = h; r.hw = S(w); r.hh = S(h); r.format = VK_FORMAT_R32_SFLOAT; r.bpp = bpp;
             if (!r.descriptor) r.descriptor = s_nextDescriptor++;
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
@@ -705,25 +741,33 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
             KLOG("rendu : resolve profondeur -> %08X (%ux%u)", destBase, w, h);
         }
         static VkBuffer buf;
-        static constexpr VkDeviceSize kSize = VkDeviceSize(1280) * kTargetHeight * 4;
+        static VkDeviceMemory bufMem;
+        static float bufScale;
+        const VkDeviceSize kSize = VkDeviceSize(S(1280u)) * S(kTargetHeight) * 4;
+        if (buf && bufScale != s_scale) { vkDestroyBuffer(s_dev, buf, nullptr); vkFreeMemory(s_dev, bufMem, nullptr); buf = VK_NULL_HANDLE; }
         if (!buf)
         {
+            bufScale = s_scale;
             VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
             bi.size = kSize;
             bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             vkCreateBuffer(s_dev, &bi, nullptr, &buf);
             VkMemoryRequirements req;
             vkGetBufferMemoryRequirements(s_dev, buf, &req);
-            vkBindBufferMemory(s_dev, buf, Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), 0);
+            bufMem = Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            vkBindBufferMemory(s_dev, buf, bufMem, 0);
         }
         dx = std::max(dx, 0); dy = std::max(dy, 0);
         uint32_t cw = uint32_t(std::min(x1 - x0, int32_t(w) - dx)), ch = uint32_t(std::min(y1 - y0, int32_t(h) - dy));
+        // en pixels hôte (rendu interne mis à l'échelle)
+        int32_t sx0 = S(x0), sy0 = S(y0), sdx = S(dx), sdy = S(dy);
+        cw = uint32_t(std::min(S(x0 + int32_t(cw)) - sx0, int32_t(r.hw) - sdx)); ch = uint32_t(std::min(S(y0 + int32_t(ch)) - sy0, int32_t(r.hh) - sdy));
         if (int32_t(cw) > 0 && int32_t(ch) > 0 && VkDeviceSize(cw) * ch * 4 <= kSize)
         {
             Transition(depth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy c{};
             c.imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
-            c.imageOffset = { x0, y0, 0 };
+            c.imageOffset = { sx0, sy0, 0 };
             c.imageExtent = { cw, ch, 1 };
             vkCmdCopyImageToBuffer(s_cmd, depth.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
             VkBufferMemoryBarrier bb{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
@@ -733,7 +777,7 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
             vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
             Transition(r.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            c.imageOffset = { dx, dy, 0 };
+            c.imageOffset = { sdx, sdy, 0 };
             vkCmdCopyBufferToImage(s_cmd, buf, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
             Transition(r.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
@@ -743,8 +787,8 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
         Resolved& r = s_resolved[key];
         if (!r.image.image || r.width != w || r.height != h || r.format != color.format)
         {
-            r.image = CreateImage(w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, color.format);
-            r.width = w; r.height = h; r.format = color.format; r.bpp = bpp;
+            r.image = CreateImage(S(w), S(h), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, color.format);
+            r.width = w; r.height = h; r.hw = S(w); r.hh = S(h); r.format = color.format; r.bpp = bpp;
             if (!r.descriptor) r.descriptor = s_nextDescriptor++;
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
@@ -756,9 +800,10 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         dx = std::max(dx, 0); dy = std::max(dy, 0);
-        copy.srcOffset = { x0, y0, 0 };
-        copy.dstOffset = { dx, dy, 0 };
-        copy.extent = { uint32_t(std::min(x1 - x0, int32_t(w) - dx)), uint32_t(std::min(y1 - y0, int32_t(h) - dy)), 1 };
+        int32_t ex = std::min(x1 - x0, int32_t(w) - dx), ey = std::min(y1 - y0, int32_t(h) - dy);
+        copy.srcOffset = { S(x0), S(y0), 0 };
+        copy.dstOffset = { S(dx), S(dy), 0 };
+        copy.extent = { uint32_t(std::min(S(x0 + ex) - S(x0), int32_t(r.hw) - S(dx))), uint32_t(std::min(S(y0 + ey) - S(y0), int32_t(r.hh) - S(dy))), 1 };
         if (int32_t(copy.extent.width) > 0 && int32_t(copy.extent.height) > 0)
             vkCmdCopyImage(s_cmd, color.image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         Transition(r.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1250,10 +1295,16 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     if (zs == 0) { zmin = 0; zmax = 1; }
     VkViewport viewport{ xo - xs, yo + ys, 2 * xs, -2 * ys, zmin, zmax };
     if (!(regs[PA_CL_VTE_CNTL] & 1) || xs == 0) viewport = { 0, 720.0f, 1280.0f, -720.0f, 0, 1 };
+    viewport.x *= s_scale; viewport.y *= s_scale; viewport.width *= s_scale; viewport.height *= s_scale;
     uint32_t tl = regs[PA_SC_WINDOW_SCISSOR_TL], br = regs[PA_SC_WINDOW_SCISSOR_BR];
     VkRect2D scissor{ { int32_t(tl & 0x7FFF), int32_t((tl >> 16) & 0x7FFF) }, { (br & 0x7FFF) - (tl & 0x7FFF), ((br >> 16) & 0x7FFF) - ((tl >> 16) & 0x7FFF) } };
     if (scissor.extent.width == 0 || scissor.offset.x + scissor.extent.width > tw || scissor.offset.y + scissor.extent.height > th)
         scissor = { { 0, 0 }, { std::min(tw, 1280u), std::min(th, 720u) } };
+    {
+        int32_t x0 = S(scissor.offset.x), y0 = S(scissor.offset.y);
+        int32_t x1 = S(scissor.offset.x + int32_t(scissor.extent.width)), y1 = S(scissor.offset.y + int32_t(scissor.extent.height));
+        scissor = { { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
+    }
     vkCmdSetViewport(s_cmd, 0, 1, &viewport);
     vkCmdSetScissor(s_cmd, 0, 1, &scissor);
 
@@ -1283,7 +1334,7 @@ void RenderPresent(uint32_t frontBuffer)
     if (it != s_resolved.end())
     {
         Transition(it->second.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        VulkanPresentFrame(it->second.image.image, it->second.width, it->second.height);
+        VulkanPresentFrame(it->second.image.image, it->second.hw, it->second.hh);
         s_presented = &it->second;
     }
     else
