@@ -801,6 +801,20 @@ static uint16_t KeyboardButtons()
 static uint16_t AutoButtons()
 {
     uint16_t b = 0;
+    // IKARUGA_PRESS="image:boutons_hex,..." : boutons maintenus 6 images à partir de l'image donnée (navigation de test)
+    static const char* press = getenv("IKARUGA_PRESS");
+    if (press)
+    {
+        extern uint64_t g_presentCount;
+        for (const char* q = press; *q;)
+        {
+            char* end; uint64_t at = strtoull(q, &end, 10);
+            if (*end != ':') break;
+            uint32_t mask = strtoul(end + 1, &end, 16);
+            if (g_presentCount >= at && g_presentCount < at + 6) b |= uint16_t(mask);
+            q = *end == ',' ? end + 1 : end;
+        }
+    }
     static const char* autoStart = getenv("IKARUGA_AUTOSTART");
     // IKARUGA_AUTOSTOP=n : plus d'appuis automatiques après l'image n (mesures en jeu sans menu pause)
     static const uint64_t autoStop = getenv("IKARUGA_AUTOSTOP") ? strtoull(getenv("IKARUGA_AUTOSTOP"), nullptr, 10) : ~0ull;
