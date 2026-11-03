@@ -1,5 +1,6 @@
 // Réimplémentation des fonctions noyau Xbox 360 (xboxkrnl / xam) utilisées par Ikaruga
 #include "guest.h"
+#include "settings.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <atomic>
@@ -770,7 +771,7 @@ static uint16_t KeyboardButtons()
 {
     const bool* k = SDL_GetKeyboardState(nullptr);
     uint16_t b = 0;
-    if (k)
+    if (k && !MenuOpen())   // menu de réglages ouvert : le clavier est à lui
     {
         if (k[SDL_SCANCODE_UP]) b |= 0x1;
         if (k[SDL_SCANCODE_DOWN]) b |= 0x2;

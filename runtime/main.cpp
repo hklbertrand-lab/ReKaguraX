@@ -2,6 +2,7 @@
 #include "guest.h"
 #include "vulkan.h"
 #include "shaders.h"
+#include "settings.h"
 #include <image.h>
 #include <xex.h>
 #include <string>
@@ -249,7 +250,9 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     timeBeginPeriod(1);   // sommeils à la milliseconde (vblank, attentes) au lieu de 15,6 ms
 #endif
-    g_window = SDL_CreateWindow("Ikaruga", 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    SettingsLoad();
+    g_window = SDL_CreateWindow("Ikaruga  (F1 : réglages)", 1280, 720, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    SettingsApplyWindow();
     if (!VulkanInit(g_window)) fprintf(stderr, "Vulkan indisponible : pas d'affichage\n");
 
 #ifdef _WIN32
@@ -330,7 +333,16 @@ int main(int argc, char** argv)
     {
         SDL_Event e;
         while (SDL_WaitEventTimeout(&e, 16))
+        {
             if (e.type == SDL_EVENT_QUIT) running = false;
+            else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat)
+            {
+                if (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))
+                    MenuHandleKey(SDL_SCANCODE_F11);   // Alt+Entrée : plein écran
+                else
+                    MenuHandleKey(e.key.scancode);
+            }
+        }
     }
     SDL_Quit();
     return 0;
