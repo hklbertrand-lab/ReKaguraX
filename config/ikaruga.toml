@@ -35,6 +35,9 @@ longjmp_address = 0x8267E350
 # la table) : fusionnés dans 82587718 et 825A8E90 (rendu des glyphes de police, qui sortaient rayés).
 functions = [
     { address = 0x821E0074, size = 0x14 },
+    # memset du jeu : XenonAnalyse le coupait après un retour conditionnel (bdzlr), les 2e et 3e octets de
+    # fin n'étaient jamais écrits (trous dans les glyphes de police, entre autres)
+    { address = 0x821E0870, size = 0xA0 },
     { address = 0x8219E208, size = 0x37C },
     { address = 0x821F8580, size = 0x108 },
     { address = 0x8222A018, size = 0x110 },

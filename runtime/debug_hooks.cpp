@@ -165,3 +165,45 @@ PPC_FUNC(sub_82170FB8)
     __imp__sub_82170FB8(ctx, base);
 }
 
+
+// Police : copie anticrénelée d'un glyphe (8 lignes source -> 1). IKARUGA_GLYPHDUMP=1 vide la source et le
+// résultat des premiers glyphes dans build/glyph_<n>_{src,dst}.bin (+ dimensions dans le journal)
+extern "C" PPC_FUNC(__imp__sub_8252F540);
+PPC_FUNC(sub_8252F540)
+{
+    static bool dump = getenv("IKARUGA_GLYPHDUMP");
+    static int n;
+    uint32_t s = ctx.r3.u32;
+    uint32_t src = Rd32(s), dst = Rd32(s + 4), srcPitch = Rd32(s + 8), dstPitch = Rd32(s + 12), h = Rd16(s + 18), w = Rd32(s + 36), rows = Rd32(s + 28), total = Rd32(s + 32);
+    __imp__sub_8252F540(ctx, base);
+    if (dump && n < 12)
+    {
+        KLOG("glyphe %d : src %08X pas %u, dst %08X pas %u, hauteur source %u, largeur %u, lignes vides %u, total %u", n, src, srcPitch, dst, dstPitch, h, w, rows, total);
+        char name[64];
+        snprintf(name, sizeof name, "build/glyph_%02d_src.bin", n);
+        if (FILE* f = fopen(name, "wb")) { fwrite(g_base + src, 1, size_t(srcPitch) * h, f); fclose(f); }
+        snprintf(name, sizeof name, "build/glyph_%02d_dst.bin", n);
+        if (FILE* f = fopen(name, "wb")) { fwrite(g_base + Rd32(s + 4), 1, 0, f); fwrite(g_base + dst, 1, size_t(dstPitch) * (total ? total : h / 8), f); fclose(f); }
+        n++;
+    }
+}
+// Police : liste RLE d'une ligne de glyphe (u16 : longueur << 4 | valeur, 15 = intérieur), IKARUGA_GLYPHDUMP
+extern "C" PPC_FUNC(__imp__sub_82537798);
+PPC_FUNC(sub_82537798)
+{
+    static bool dump = getenv("IKARUGA_GLYPHDUMP");
+    static int n;
+    if (dump && n < 400)
+    {
+        std::string s;
+        uint32_t total = 0;
+        for (uint32_t p = ctx.r5.u32, i = 0; i < 64; i++, p += 2)
+        {
+            uint16_t v = Rd16(p);
+            if (!v) break;
+            char b[16]; snprintf(b, sizeof b, " %u:%u", v >> 4, v & 15); s += b; total += v >> 4;
+        }
+        KLOG("ligne %d (r4=%d) total %u :%s", n++, int32_t(ctx.r4.u32), total, s.c_str());
+    }
+    __imp__sub_82537798(ctx, base);
+}
