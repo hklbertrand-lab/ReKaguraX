@@ -765,7 +765,16 @@ static SDL_Gamepad* Pad(uint32_t index)
     return p;
 }
 
-// Clavier = manette virtuelle du joueur 1 (toujours connectée) : Entrée=START, Échap=BACK, flèches=croix,
+// Le clavier est le joueur suivant les manettes : joueur 1 sans manette, joueur 2 avec une manette, etc.
+// (avec 4 manettes, il s'ajoute au joueur 1)
+static uint32_t KeyboardUser()
+{
+    int count = 0;
+    SDL_free(SDL_GetGamepads(&count));
+    return count < 4 ? uint32_t(count) : 0;
+}
+
+// Clavier = manette virtuelle (toujours connectée) : Entrée=START, Échap=BACK, flèches=croix,
 // W/X/C/V=A/B/X/Y (disposition AZERTY : touches du bas à gauche). IKARUGA_AUTOSTART=n appuie sur START
 // toutes les n images (tests sans clavier).
 static uint16_t KeyboardButtons()
@@ -785,6 +794,13 @@ static uint16_t KeyboardButtons()
         if (k[SDL_SCANCODE_C]) b |= 0x4000;
         if (k[SDL_SCANCODE_V]) b |= 0x8000;
     }
+    return b;
+}
+
+// Appuis automatiques des tests, toujours pour le joueur 1
+static uint16_t AutoButtons()
+{
+    uint16_t b = 0;
     static const char* autoStart = getenv("IKARUGA_AUTOSTART");
     // IKARUGA_AUTOSTOP=n : plus d'appuis automatiques après l'image n (mesures en jeu sans menu pause)
     static const uint64_t autoStop = getenv("IKARUGA_AUTOSTOP") ? strtoull(getenv("IKARUGA_AUTOSTOP"), nullptr, 10) : ~0ull;
@@ -803,7 +819,7 @@ static uint16_t KeyboardButtons()
 KFUNC(XamInputGetCapabilities)   // (user, flags, caps)
 {
     if (getenv("IKARUGA_INPUTLOG")) { static std::atomic<uint32_t> seen; uint32_t bit = 1u << std::min<uint32_t>(ARG(3), 31); if (!(seen.fetch_or(bit) & bit)) KLOG("XamInputGetCapabilities : joueur %u", ARG(3)); }
-    if (!Pad(ARG(3)) && ARG(3) != 0) RET(1167);   // ERROR_DEVICE_NOT_CONNECTED (le clavier tient lieu de manette 1)
+    if (!Pad(ARG(3)) && ARG(3) != KeyboardUser()) RET(1167);   // ERROR_DEVICE_NOT_CONNECTED
     memset(g_base + ARG(5), 0, 0x14);
     Wr8(ARG(5), 1); Wr8(ARG(5) + 1, 1);   // XINPUT_DEVTYPE_GAMEPAD / SUBTYPE_GAMEPAD
     RET(0);
@@ -815,19 +831,20 @@ KFUNC(XamInputGetState)   // (user, flags, state)
     if (getenv("IKARUGA_INPUTLOG")) { static std::atomic<uint32_t> seen; uint32_t bit = 1u << std::min<uint32_t>(ARG(3), 31); if (!(seen.fetch_or(bit) & bit)) KLOG("XamInputGetState : premier appel joueur %u (manette %s)", ARG(3), p ? "oui" : "non"); }
     static std::atomic<uint32_t> packet;
     uint32_t s = ARG(5);
+    bool keyboard = ARG(3) == KeyboardUser();
     if (!p)
     {
-        if (ARG(3) != 0) RET(1167);
+        if (!keyboard) RET(1167);
         memset(g_base + s, 0, 16);
         Wr32(s, ++packet);
-        uint16_t kb = KeyboardButtons();
+        uint16_t kb = KeyboardButtons() | (ARG(3) == 0 ? AutoButtons() : 0);
         Wr16(s + 4, kb);
         static uint32_t calls, pressed; calls++; if (kb) pressed++;
         static auto last = std::chrono::steady_clock::now();
         if (getenv("IKARUGA_INPUTLOG") && std::chrono::steady_clock::now() - last > std::chrono::seconds(3)) { last = std::chrono::steady_clock::now(); KLOG("XamInputGetState : %u appels, %u avec boutons (flags %08X, retour %08X)", calls, pressed, ARG(4), uint32_t(ctx.lr)); }
         RET(0);
     }
-    uint16_t b = KeyboardButtons();
+    uint16_t b = (keyboard ? KeyboardButtons() : 0) | (ARG(3) == 0 ? AutoButtons() : 0);
     struct { SDL_GamepadButton sdl; uint16_t x; } map[] = {
         { SDL_GAMEPAD_BUTTON_DPAD_UP, 0x1 }, { SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0x2 }, { SDL_GAMEPAD_BUTTON_DPAD_LEFT, 0x4 },
         { SDL_GAMEPAD_BUTTON_DPAD_RIGHT, 0x8 }, { SDL_GAMEPAD_BUTTON_START, 0x10 }, { SDL_GAMEPAD_BUTTON_BACK, 0x20 },
@@ -858,10 +875,10 @@ KFUNC(XamInputSetState) { RET(0); }
 
 // ---------------------------------------------------------------- profil / Live (hors ligne)
 
-// Joueurs connectés localement : le 1 (clavier) et chaque manette branchée (mode 2 joueurs)
+// Joueurs connectés localement : le 1, chaque manette branchée et le clavier (mode 2 joueurs)
 static uint32_t SigninMask()
 {
-    uint32_t mask = 1;
+    uint32_t mask = 1u | 1u << KeyboardUser();
     for (uint32_t i = 1; i < 4; i++) if (Pad(i)) mask |= 1u << i;
     return mask;
 }
