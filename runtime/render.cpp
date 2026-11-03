@@ -10,6 +10,7 @@
 #include "vulkan.h"
 #include <algorithm>
 #include <array>
+#include <string>
 #include <cmath>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,15 @@ static constexpr uint32_t kTargetHeight = 1024;   // hauteur des cibles (l'EDRAM
 // Rendu interne : les cibles, viewports, scissors et copies sont multipliés par s_scale (1 = 720p d'origine).
 // Les adresses, pas et tuiles restent en coordonnées du jeu.
 static float s_scale = 1.0f;
+
+// Mode large (expérimental) : la zone de jeu verticale (cibles de pas 600 et 560, viewport 540x720) est rendue sur
+// 1280 de large ; la composante X de la projection (ligne c0 de g_mWVP) est multipliée par 540/1280 pour élargir le
+// champ sans étirer. Dans l'image finale, les panneaux latéraux sont omis et la zone de jeu (x 370-910) étirée sur
+// toute la largeur. Spécifique à Ikaruga.
+static bool s_wide = false;
+static constexpr uint32_t kWideWidth = 1280, kFieldWidth = 540, kFieldLeft = 370;
+static bool IsFieldPitch(uint32_t pitch) { return pitch == 600 || pitch == 560; }
+static bool s_wideFieldThisFrame = false;   // une zone de jeu large a été copiée dans l'image en cours
 static inline uint32_t S(uint32_t v) { return uint32_t(v * s_scale + 0.5f); }
 static inline int32_t S(int32_t v) { return int32_t(v * s_scale + (v >= 0 ? 0.5f : -0.5f)); }
 static constexpr VkDeviceSize kUploadSize = 64 << 20;
@@ -55,9 +65,9 @@ static VkDevice s_dev;
 static Image s_white;
 
 // width/height : taille côté jeu ; hw/hh : taille réelle de l'image (rendu interne mis à l'échelle)
-struct ColorTarget { Image image; VkFormat format; uint32_t width, height, hw, hh; };
+struct ColorTarget { Image image; VkFormat format; uint32_t width, height, hw, hh; bool wide = false; };
 struct DepthTarget { Image image; uint32_t width, height, hw, hh; };
-struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0, bpp = 4, hw = 0, hh = 0; };
+struct Resolved { Image image; VkFormat format = VK_FORMAT_UNDEFINED; uint32_t width = 0, height = 0, descriptor = 0, bpp = 4, hw = 0, hh = 0; bool wide = false; };
 struct TextureFormatInfo { VkFormat vk; uint32_t blockSize, bytesPerBlock; };
 static TextureFormatInfo TextureFormat(uint32_t fmt);
 static std::unordered_map<uint64_t, ColorTarget> s_colorTargets;       // (base EDRAM, format, pitch)
@@ -291,7 +301,8 @@ static bool BeginCommands()
     s_cmd = VulkanFrameCmd();
     if (!s_frameStarted)
     {
-        if (float want = SettingsScale(); want != s_scale) RebuildForScale(want);
+        if (float want = SettingsScale(); want != s_scale || g_settings.wide != s_wide) { s_wide = g_settings.wide; RebuildForScale(want); }
+        s_wideFieldThisFrame = false;
         s_frameStarted = true;
         s_frameId++;
         s_uploadBegin = s_uploadOffset = VulkanFrameSlot() * (kUploadSize / 2);
@@ -401,7 +412,8 @@ static ColorTarget& GetColorTarget(const uint32_t* regs)
         t.format = ColorFormat(format);
         t.width = width;
         t.height = kTargetHeight;
-        t.hw = S(width); t.hh = S(kTargetHeight);
+        t.wide = s_wide && IsFieldPitch(width);
+        t.hw = S(t.wide ? kWideWidth + 64 : width); t.hh = S(kTargetHeight);
         t.image = CreateImage(t.hw, t.hh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, t.format);
         VkClearColorValue black{};
         VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -436,7 +448,7 @@ static DepthTarget& GetDepthTarget(const uint32_t* regs, uint32_t width, uint32_
 static void BeginTargets(const uint32_t* regs)
 {
     ColorTarget& color = GetColorTarget(regs);
-    DepthTarget& depth = GetDepthTarget(regs, color.width, color.height);
+    DepthTarget& depth = GetDepthTarget(regs, color.wide ? kWideWidth + 64 : color.width, color.height);
     if (s_inRenderPass && s_curColor == &color && s_curDepth == &depth) return;
     EndRenderPass();
     s_curColor = &color;
@@ -695,7 +707,7 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
     }
     uint32_t control = regs[RB_COPY_CONTROL];
     ColorTarget& color = GetColorTarget(regs);
-    DepthTarget& depth = GetDepthTarget(regs, color.width, color.height);
+    DepthTarget& depth = GetDepthTarget(regs, color.wide ? kWideWidth + 64 : color.width, color.height);   // même tampon que BeginTargets
     uint32_t source = control & 7, command = (control >> 20) & 3;
     uint32_t destBase = regs[RB_COPY_DEST_BASE] & 0x1FFFFFFF, destPitch = regs[RB_COPY_DEST_PITCH] & 0x3FFF;
     uint32_t destHeight = (regs[RB_COPY_DEST_PITCH] >> 16) & 0x3FFF;
@@ -727,13 +739,16 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
     // Resolve de la profondeur (source 4) : le décor relit la profondeur de la scène (texture 24_8_FLOAT) ;
     // sans elle il échantillonnait la texture blanche (profondeur 1 partout) et ses surfaces devenaient unies.
     // Vulkan ne copie pas une image de profondeur vers une image couleur : on passe par un tampon.
+    // Mode large : la copie couvre toute la largeur rendue, la destination devient large elle aussi
+    uint32_t hostW = S(w);
+    if (color.wide) { x0 = 0; x1 = int32_t(kWideWidth); hostW = S(kWideWidth); s_wideFieldThisFrame = true; }
     if (source == 4 && command != 3 && destBase && w && h && x1 > x0 && y1 > y0)
     {
         Resolved& r = s_resolved[key];
-        if (!r.image.image || r.width != w || r.height != h || r.format != VK_FORMAT_R32_SFLOAT)
+        if (!r.image.image || r.width != w || r.height != h || r.format != VK_FORMAT_R32_SFLOAT || r.hw != hostW)
         {
-            r.image = CreateImage(S(w), S(h), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_R32_SFLOAT);
-            r.width = w; r.height = h; r.hw = S(w); r.hh = S(h); r.format = VK_FORMAT_R32_SFLOAT; r.bpp = bpp;
+            r.image = CreateImage(hostW, S(h), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_R32_SFLOAT);
+            r.width = w; r.height = h; r.hw = hostW; r.hh = S(h); r.format = VK_FORMAT_R32_SFLOAT; r.bpp = bpp; r.wide = color.wide;
             if (!r.descriptor) r.descriptor = s_nextDescriptor++;
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
@@ -758,7 +773,7 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
             vkBindBufferMemory(s_dev, buf, bufMem, 0);
         }
         dx = std::max(dx, 0); dy = std::max(dy, 0);
-        uint32_t cw = uint32_t(std::min(x1 - x0, int32_t(w) - dx)), ch = uint32_t(std::min(y1 - y0, int32_t(h) - dy));
+        uint32_t cw = uint32_t(std::min(x1 - x0, int32_t(color.wide ? kWideWidth : w) - dx)), ch = uint32_t(std::min(y1 - y0, int32_t(h) - dy));
         // en pixels hôte (rendu interne mis à l'échelle)
         int32_t sx0 = S(x0), sy0 = S(y0), sdx = S(dx), sdy = S(dy);
         cw = uint32_t(std::min(S(x0 + int32_t(cw)) - sx0, int32_t(r.hw) - sdx)); ch = uint32_t(std::min(S(y0 + int32_t(ch)) - sy0, int32_t(r.hh) - sdy));
@@ -785,10 +800,10 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
     if (source < 4 && command != 3 && destBase && w && h && x1 > x0 && y1 > y0)
     {
         Resolved& r = s_resolved[key];
-        if (!r.image.image || r.width != w || r.height != h || r.format != color.format)
+        if (!r.image.image || r.width != w || r.height != h || r.format != color.format || r.hw != hostW)
         {
-            r.image = CreateImage(S(w), S(h), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, color.format);
-            r.width = w; r.height = h; r.hw = S(w); r.hh = S(h); r.format = color.format; r.bpp = bpp;
+            r.image = CreateImage(hostW, S(h), VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, color.format);
+            r.width = w; r.height = h; r.hw = hostW; r.hh = S(h); r.format = color.format; r.bpp = bpp; r.wide = color.wide;
             if (!r.descriptor) r.descriptor = s_nextDescriptor++;
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, r.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             VkWriteDescriptorSet wr{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_sets[0], 0, r.descriptor, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii };
@@ -800,7 +815,7 @@ static void Resolve(const uint32_t* regs, uint32_t (*phys)(uint32_t))
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         dx = std::max(dx, 0); dy = std::max(dy, 0);
-        int32_t ex = std::min(x1 - x0, int32_t(w) - dx), ey = std::min(y1 - y0, int32_t(h) - dy);
+        int32_t ex = std::min(x1 - x0, int32_t(color.wide ? kWideWidth : w) - dx), ey = std::min(y1 - y0, int32_t(h) - dy);
         copy.srcOffset = { S(x0), S(y0), 0 };
         copy.dstOffset = { S(dx), S(dy), 0 };
         copy.extent = { uint32_t(std::min(S(x0 + ex) - S(x0), int32_t(r.hw) - S(dx))), uint32_t(std::min(S(y0 + ey) - S(y0), int32_t(r.hh) - S(dy))), 1 };
@@ -1233,7 +1248,17 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         float c[4]; memcpy(c, regs + ALU_CONSTANTS + 256 * 4, 16);
         if (n++ % 60 == 0) KLOG("remplissage g_vMCol = %.3f %.3f %.3f %.3f, blend %08X", c[0], c[1], c[2], c[3], regs[RB_BLENDCONTROL0]);
     }
-    VkDeviceSize vsConst = UploadConstants(0, regs + ALU_CONSTANTS, 4096);
+    VkDeviceSize vsConst;
+    if (s_wide && IsFieldPitch(regs[RB_SURFACE_INFO] & 0x3FFF) && (regs[RB_SURFACE_INFO] & 0x3FFF) == 600)
+    {
+        // Passe 3D en mode large : X de clip multiplié par 540/1280 (ligne c0 de g_mWVP) -> champ élargi, sans étirement
+        float c[1024];
+        memcpy(c, regs + ALU_CONSTANTS, 4096);
+        for (int i = 0; i < 4; i++) c[i] *= float(kFieldWidth) / float(kWideWidth);
+        vsConst = UploadConstants(0, c, 4096);
+    }
+    else
+        vsConst = UploadConstants(0, regs + ALU_CONSTANTS, 4096);
     VkDeviceSize psConst = UploadConstants(1, regs + ALU_CONSTANTS + 256 * 4, 3584);
     uint8_t shared[1024]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha, boucles
     // Textures du pixel shader : l'échantillonneur n lit la fetch constant n ; indices 2D en c0-c3, samplers en c12-c15
@@ -1295,11 +1320,41 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     if (zs == 0) { zmin = 0; zmax = 1; }
     VkViewport viewport{ xo - xs, yo + ys, 2 * xs, -2 * ys, zmin, zmax };
     if (!(regs[PA_CL_VTE_CNTL] & 1) || xs == 0) viewport = { 0, 720.0f, 1280.0f, -720.0f, 0, 1 };
+    bool fieldComposite = false;
+    if (s_curColor->wide)
+    {
+        // zone de jeu large : viewport et scissor sur toute la largeur
+        viewport.x = 0; viewport.width = float(kWideWidth);
+    }
+    else if (s_wideFieldThisFrame)
+    {
+        // Image finale : le rectangle qui pose la zone de jeu (x 370-910) est étiré sur toute la largeur ;
+        // les autres rectangles plein écran de la même passe (panneaux latéraux) sont omis
+        // (texture 0 seulement : les emplacements 10-11 gardent les copies de la passe 3D d'un dessin à l'autre)
+        bool readsField = false;
+        const uint32_t* f0 = regs + FETCH_CONSTANTS;
+        if ((initiator & 0x3F) == 8 && (f0[0] & 3) == 2)
+        {
+            auto it = s_resolved.find(((f0[1] >> 12) << 12) & 0x1FFFFFFF);
+            readsField = it != s_resolved.end() && it->second.wide;
+        }
+        if (readsField)
+        {
+            float k = float(kWideWidth) / float(kFieldWidth);
+            viewport.x = viewport.x * k - float(kFieldLeft) * k;
+            viewport.width *= k;
+            fieldComposite = true;
+        }
+        else if ((initiator & 0x3F) == 8 && s_ps->containerHash == 0x149be5ee809351beull)
+            return;   // panneau latéral
+    }
     viewport.x *= s_scale; viewport.y *= s_scale; viewport.width *= s_scale; viewport.height *= s_scale;
+    (void)fieldComposite;
     uint32_t tl = regs[PA_SC_WINDOW_SCISSOR_TL], br = regs[PA_SC_WINDOW_SCISSOR_BR];
     VkRect2D scissor{ { int32_t(tl & 0x7FFF), int32_t((tl >> 16) & 0x7FFF) }, { (br & 0x7FFF) - (tl & 0x7FFF), ((br >> 16) & 0x7FFF) - ((tl >> 16) & 0x7FFF) } };
     if (scissor.extent.width == 0 || scissor.offset.x + scissor.extent.width > tw || scissor.offset.y + scissor.extent.height > th)
         scissor = { { 0, 0 }, { std::min(tw, 1280u), std::min(th, 720u) } };
+    if (s_curColor->wide) { scissor.offset.x = 0; scissor.extent.width = kWideWidth; }
     {
         int32_t x0 = S(scissor.offset.x), y0 = S(scissor.offset.y);
         int32_t x1 = S(scissor.offset.x + int32_t(scissor.extent.width)), y1 = S(scissor.offset.y + int32_t(scissor.extent.height));
@@ -1307,6 +1362,26 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     }
     vkCmdSetViewport(s_cmd, 0, 1, &viewport);
     vkCmdSetScissor(s_cmd, 0, 1, &scissor);
+    {
+        // Débogage : IKARUGA_PASSLOG=n -> structure de l'image n (cible, shaders, viewport, textures copiées lues)
+        extern uint64_t g_presentCount;
+        static uint64_t passFrom = getenv("IKARUGA_PASSLOG") ? strtoull(getenv("IKARUGA_PASSLOG"), nullptr, 10) : 0;
+        if (passFrom && g_presentCount == passFrom)
+        {
+            std::string tex;
+            for (uint32_t slot = 0; slot < 16; slot++)
+            {
+                const uint32_t* f = regs + FETCH_CONSTANTS + slot * 6;
+                if ((f[0] & 3) != 2) continue;
+                uint32_t b = (f[1] >> 12) << 12 & 0x1FFFFFFF;
+                if (s_resolved.count(b)) { char t[32]; snprintf(t, sizeof t, " t%u=%08X", slot, b); tex += t; }
+            }
+            KLOG("passe cible %ux%u fmt %d vs %016llx ps %016llx vp (%.0f,%.0f %.0fx%.0f) sc (%d,%d %ux%u) prim %u n %u%s",
+                s_curColor->width, s_curColor->height, int(s_curColor->format), (unsigned long long)s_vs->containerHash, (unsigned long long)s_ps->containerHash,
+                viewport.x, viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height,
+                initiator & 0x3F, initiator >> 16, tex.c_str());
+        }
+    }
 
     vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipelineLayout, 0, 4, s_sets, 0, nullptr);
