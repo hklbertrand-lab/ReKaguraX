@@ -787,6 +787,8 @@ static uint16_t KeyboardButtons()
     // IKARUGA_AUTOSTOP=n : plus d'appuis automatiques après l'image n (mesures en jeu sans menu pause)
     static const uint64_t autoStop = getenv("IKARUGA_AUTOSTOP") ? strtoull(getenv("IKARUGA_AUTOSTOP"), nullptr, 10) : ~0ull;
     extern uint64_t g_presentCount;
+    static const bool autoFire = getenv("IKARUGA_AUTOFIRE");   // A maintenu en permanence (tir) pour les tests
+    if (autoFire && g_presentCount >= autoStop) b |= 0x1000;
     if (autoStart && g_presentCount < autoStop)
     {
         static uint32_t calls;
@@ -1090,7 +1092,7 @@ KFUNC(_vsnprintf)   // (buffer, count, format, va_list) : formatage minimal faç
 // Le jeu enregistre un callback que le système appelle à chaque trame consommée (256 échantillons,
 // 48 kHz -> 5,33 ms). Sans ces appels, son moteur audio (et les écrans qui attendent un son) se bloque.
 // Les trames soumises partent vers SDL (apu.cpp) ; une fois la sortie ouverte, le rythme des appels suit la
-// file de la carte son (4 trames d'avance, ~21 ms) au lieu d'un minuteur qui dériverait.
+// file de la carte son (8 trames d'avance, ~43 ms : une image lente ne vide pas la file) au lieu d'un minuteur qui dériverait.
 
 void ApuSubmitFrame(uint32_t samples);
 uint32_t ApuQueuedFrames();
@@ -1113,12 +1115,13 @@ KFUNC(XAudioRegisterRenderDriverClient)   // (callbackPtr -> {fonction, argument
             PPCContext ctx;
             GuestInitThreadContext(ctx, 0x10000);
             DebugRegisterThread("audio");
+            SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);   // la file audio ne doit pas se vider
             auto next = std::chrono::steady_clock::now();
             while (s_audioRunning)
             {
                 if (ApuOutputOpen())
                 {
-                    if (ApuQueuedFrames() >= 4) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+                    if (ApuQueuedFrames() >= 8) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
                 }
                 else
                 {

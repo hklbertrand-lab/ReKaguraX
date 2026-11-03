@@ -309,6 +309,14 @@ void ApuSubmitFrame(uint32_t samples)
         stereo[i * 2] = std::clamp(at(0, i) + c + at(4, i) * 0.707f, -1.0f, 1.0f);
         stereo[i * 2 + 1] = std::clamp(at(1, i) + c + at(5, i) * 0.707f, -1.0f, 1.0f);
     }
+    static bool timing = getenv("IKARUGA_TIMING");
+    if (timing)
+    {
+        // File vide au moment de soumettre : la carte son a manqué d'échantillons (craquement audible)
+        static uint32_t starved, frames;
+        if (SDL_GetAudioStreamQueued(s_stream) == 0 && frames > 200) starved++;
+        if (++frames % 1875 == 0) { KLOG("audio : %u trames soumises file vide sur les 10 dernières s", starved); starved = 0; }
+    }
     SDL_PutAudioStreamData(s_stream, stereo, sizeof(stereo));
 
     // Débogage : IKARUGA_WAV=fichier -> enregistre la sortie (flottants 48 kHz stéréo, en-tête écrit à la fin)
