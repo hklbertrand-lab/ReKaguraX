@@ -802,6 +802,7 @@ static uint16_t KeyboardButtons()
 
 KFUNC(XamInputGetCapabilities)   // (user, flags, caps)
 {
+    if (getenv("IKARUGA_INPUTLOG")) { static std::atomic<uint32_t> seen; uint32_t bit = 1u << std::min<uint32_t>(ARG(3), 31); if (!(seen.fetch_or(bit) & bit)) KLOG("XamInputGetCapabilities : joueur %u", ARG(3)); }
     if (!Pad(ARG(3)) && ARG(3) != 0) RET(1167);   // ERROR_DEVICE_NOT_CONNECTED (le clavier tient lieu de manette 1)
     memset(g_base + ARG(5), 0, 0x14);
     Wr8(ARG(5), 1); Wr8(ARG(5) + 1, 1);   // XINPUT_DEVTYPE_GAMEPAD / SUBTYPE_GAMEPAD
@@ -811,6 +812,7 @@ KFUNC(XamInputGetCapabilities)   // (user, flags, caps)
 KFUNC(XamInputGetState)   // (user, flags, state)
 {
     SDL_Gamepad* p = Pad(ARG(3));
+    if (getenv("IKARUGA_INPUTLOG")) { static std::atomic<uint32_t> seen; uint32_t bit = 1u << std::min<uint32_t>(ARG(3), 31); if (!(seen.fetch_or(bit) & bit)) KLOG("XamInputGetState : premier appel joueur %u (manette %s)", ARG(3), p ? "oui" : "non"); }
     static std::atomic<uint32_t> packet;
     uint32_t s = ARG(5);
     if (!p)
@@ -856,9 +858,18 @@ KFUNC(XamInputSetState) { RET(0); }
 
 // ---------------------------------------------------------------- profil / Live (hors ligne)
 
-KFUNC(XamUserGetSigninState) { RET(ARG(3) == 0 ? 1 : 0); }   // joueur 1 connecté localement
-KFUNC(XamUserGetXUID) { if (ARG(4)) Wr64(ARG(4), 0xE000000000000001ull); RET(0); }
-KFUNC(XamUserGetName) { strncpy((char*)g_base + ARG(4), "Joueur", ARG(5)); RET(0); }
+// Joueurs connectés localement : le 1 (clavier) et chaque manette branchée (mode 2 joueurs)
+static uint32_t SigninMask()
+{
+    uint32_t mask = 1;
+    for (uint32_t i = 1; i < 4; i++) if (Pad(i)) mask |= 1u << i;
+    return mask;
+}
+static bool SignedIn(uint32_t user) { return user < 4 && (SigninMask() >> user & 1); }
+
+KFUNC(XamUserGetSigninState) { RET(SignedIn(ARG(3)) ? 1 : 0); }
+KFUNC(XamUserGetXUID) { if (!SignedIn(ARG(3))) RET(0x525); if (ARG(4)) Wr64(ARG(4), 0xE000000000000001ull + ARG(3)); RET(0); }
+KFUNC(XamUserGetName) { snprintf((char*)g_base + ARG(4), ARG(5), ARG(3) ? "Joueur %u" : "Joueur", ARG(3) + 1); RET(0); }
 KFUNC(XamUserCheckPrivilege) { if (ARG(5)) Wr32(ARG(5), 1); RET(0); }
 // Notifications système : file par écouteur ; comme Xenia, le premier écouteur système reçoit au
 // démarrage XN_SYS_UI (1 puis 0) et deux XN_SYS_SIGNINCHANGED, que certains jeux attendent.
@@ -867,6 +878,8 @@ struct KNotifyListener : KEvent
     std::deque<std::pair<uint32_t, uint32_t>> queue;   // (identifiant, paramètre)
     uint64_t mask = 0;
 };
+
+static std::weak_ptr<KNotifyListener> s_systemListener;
 
 KFUNC(XamNotifyCreateListener)   // (masque 64 bits, version max)
 {
@@ -879,6 +892,7 @@ KFUNC(XamNotifyCreateListener)   // (masque 64 bits, version max)
         startupSent = true;
         l->queue = { { 0x00000009, 1 }, { 0x00000009, 0 }, { 0x0000000A, 1 }, { 0x0000000A, 1 } };
         l->Signal();
+        s_systemListener = l;
     }
     KLOG("XamNotifyCreateListener masque=%llx", (unsigned long long)l->mask);
     RET(NewHandle(l));
@@ -891,6 +905,22 @@ KFUNC(XNotifyGetNext)   // (handle, idCherché, pId, pParam)
     Wr32(ARG(5), 0);
     auto l = std::dynamic_pointer_cast<KNotifyListener>(FromHandle(ARG(3)));
     if (!l) RET(0);
+    if (l == s_systemListener.lock())
+    {
+        // manette branchée/débranchée : XN_SYS_INPUTDEVICESCHANGED puis XN_SYS_SIGNINCHANGED (masque des joueurs)
+        static uint32_t lastMask = 1;
+        if (uint32_t mask = SigninMask(); mask != lastMask)
+        {
+            KLOG("joueurs connectés : %X -> %X", lastMask, mask);
+            lastMask = mask;
+            {
+                std::lock_guard lock(l->m);
+                l->queue.push_back({ 0x00000012, 0 });
+                l->queue.push_back({ 0x0000000A, mask });
+            }
+            l->Signal();
+        }
+    }
     std::lock_guard lock(l->m);
     for (auto it = l->queue.begin(); it != l->queue.end(); ++it)
         if (!ARG(4) || it->first == ARG(4))
@@ -1164,10 +1194,10 @@ extern "C" uint64_t GuestTimebase()
 KFUNC(XamUserGetSigninInfo)   // (user, flags, XUSER_SIGNIN_INFO*) : joueur 1 connecté localement
 {
     memset(g_base + ARG(5), 0, 0x28);
-    if (ARG(3) != 0) RET(0x525);   // ERROR_NO_SUCH_USER
-    Wr64(ARG(5), 0xE000000000000001ull);    // xuid
+    if (!SignedIn(ARG(3))) RET(0x525);   // ERROR_NO_SUCH_USER
+    Wr64(ARG(5), 0xE000000000000001ull + ARG(3));    // xuid
     Wr32(ARG(5) + 0xC, 1);                  // XUserSigninState_SignedInLocally
-    strcpy((char*)g_base + ARG(5) + 0x18, "Joueur");
+    snprintf((char*)g_base + ARG(5) + 0x18, 16, ARG(3) ? "Joueur %u" : "Joueur", ARG(3) + 1);
     RET(0);
 }
 
