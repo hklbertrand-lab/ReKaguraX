@@ -342,6 +342,10 @@ int main(int argc, char** argv)
                 else
                     MenuHandleKey(e.key.scancode);
             }
+            // les événements manette ne sont émis que pour les manettes ouvertes
+            else if (e.type == SDL_EVENT_GAMEPAD_ADDED) SDL_OpenGamepad(e.gdevice.which);
+            else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN)
+                MenuHandlePad(e.gbutton.button, SDL_GetGamepadFromID(e.gbutton.which));
         }
     }
     SDL_Quit();

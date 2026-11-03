@@ -754,6 +754,7 @@ static SDL_Gamepad* Pad(uint32_t index)
 {
     static SDL_Gamepad* pads[4];
     if (index >= 4) return nullptr;
+    if (pads[index] && !SDL_GamepadConnected(pads[index])) { SDL_CloseGamepad(pads[index]); pads[index] = nullptr; }   // débranchée
     if (!pads[index])
     {
         int count = 0;
@@ -831,9 +832,17 @@ KFUNC(XamInputGetState)   // (user, flags, state)
         { SDL_GAMEPAD_BUTTON_LEFT_STICK, 0x40 }, { SDL_GAMEPAD_BUTTON_RIGHT_STICK, 0x80 }, { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0x100 },
         { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, 0x200 }, { SDL_GAMEPAD_BUTTON_GUIDE, 0x400 }, { SDL_GAMEPAD_BUTTON_SOUTH, 0x1000 },
         { SDL_GAMEPAD_BUTTON_EAST, 0x2000 }, { SDL_GAMEPAD_BUTTON_WEST, 0x4000 }, { SDL_GAMEPAD_BUTTON_NORTH, 0x8000 } };
-    for (auto& m : map) if (SDL_GetGamepadButton(p, m.sdl)) b |= m.x;
+    uint16_t padButtons = 0;
+    for (auto& m : map) if (SDL_GetGamepadButton(p, m.sdl)) padButtons |= m.x;
     auto axis = [&](SDL_GamepadAxis a, bool invert) { int v = SDL_GetGamepadAxis(p, a); return uint16_t(invert ? std::min(32767, -v) : v); };
     Wr32(s, ++packet);
+    if (MenuBlocksPad(padButtons != 0))   // menu ouvert (ou tout juste fermé) : manette au repos pour le jeu
+    {
+        memset(g_base + s + 4, 0, 12);
+        Wr16(s + 4, b);
+        RET(0);
+    }
+    b |= padButtons;
     Wr16(s + 4, b);
     Wr8(s + 6, SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
     Wr8(s + 7, SDL_GetGamepadAxis(p, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);

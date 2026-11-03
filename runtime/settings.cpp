@@ -122,6 +122,39 @@ bool MenuHandleKey(int scancode)
     return true;   // menu ouvert : aucune touche ne part au jeu
 }
 
+// Manette : L3+R3 ouvre/ferme le menu ; croix pour naviguer, A valide, B ferme
+static std::atomic<bool> s_padHold;   // menu fermé à la manette : entrées bloquées jusqu'au relâchement
+
+void MenuHandlePad(int button, SDL_Gamepad* pad)
+{
+    if ((button == SDL_GAMEPAD_BUTTON_LEFT_STICK && pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK)) ||
+        (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK && pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK)))
+    {
+        s_open = !s_open;
+        s_padHold = true;
+        return;
+    }
+    if (!s_open) return;
+    switch (button)
+    {
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: MenuHandleKey(SDL_SCANCODE_UP); break;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: MenuHandleKey(SDL_SCANCODE_DOWN); break;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: MenuHandleKey(SDL_SCANCODE_LEFT); break;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: case SDL_GAMEPAD_BUTTON_SOUTH: MenuHandleKey(SDL_SCANCODE_RIGHT); break;
+    case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_START: MenuHandleKey(SDL_SCANCODE_ESCAPE); break;
+    default: break;
+    }
+    if (!s_open) s_padHold = true;
+}
+
+// Le jeu ne voit pas la manette pendant le menu, ni juste après tant qu'un bouton reste enfoncé
+bool MenuBlocksPad(bool anyPressed)
+{
+    if (s_open) return true;
+    if (s_padHold && !anyPressed) s_padHold = false;
+    return s_padHold;
+}
+
 bool MenuRender(uint32_t* pixels, int width, int height)
 {
     if (!s_open) return false;
@@ -156,8 +189,9 @@ bool MenuRender(uint32_t* pixels, int width, int height)
         SDL_RenderDebugText(r, 12, y, lines[i]);
     }
     SDL_SetRenderDrawColor(r, 140, 140, 150, 255);
-    SDL_RenderDebugText(r, 12, 108, "Fleches : choisir/changer  Echap : fermer");
-    SDL_RenderDebugText(r, 12, 118, "F1 : menu   F11 / Alt+Entree : plein ecran");
+    SDL_RenderDebugText(r, 12, 102, "Fleches : choisir/changer  Echap : fermer");
+    SDL_RenderDebugText(r, 12, 112, "F1 : menu   F11 / Alt+Entree : plein ecran");
+    SDL_RenderDebugText(r, 12, 122, "Manette: L3+R3 menu  A changer  B fermer");
     SDL_RenderPresent(r);
     SDL_DestroyRenderer(r);
     SDL_DestroySurface(surface);
