@@ -122,7 +122,7 @@ bool MenuHandleKey(int scancode)
     return true;   // menu ouvert : aucune touche ne part au jeu
 }
 
-// Manette : L3+R3 ouvre/ferme le menu ; croix pour naviguer, A valide, B ferme
+// Manette : L3+R3 ouvre/ferme le menu ; croix ou stick gauche pour naviguer, A valide, B ferme
 static std::atomic<bool> s_padHold;   // menu fermé à la manette : entrées bloquées jusqu'au relâchement
 
 void MenuHandlePad(int button, SDL_Gamepad* pad)
@@ -144,6 +144,21 @@ void MenuHandlePad(int button, SDL_Gamepad* pad)
     case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_START: MenuHandleKey(SDL_SCANCODE_ESCAPE); break;
     default: break;
     }
+    if (!s_open) s_padHold = true;
+}
+
+// Stick gauche : une impulsion par poussée franche (seuil haut), réarmée près du centre (seuil bas)
+void MenuHandlePadAxis(int axis, int value)
+{
+    static int held[2];   // -1, 0, +1 par axe X / Y
+    int i = axis == SDL_GAMEPAD_AXIS_LEFTX ? 0 : axis == SDL_GAMEPAD_AXIS_LEFTY ? 1 : -1;
+    if (i < 0) return;
+    int dir = value > 20000 ? 1 : value < -20000 ? -1 : (std::abs(value) < 8000 ? 0 : held[i]);
+    if (dir == held[i]) return;
+    held[i] = dir;
+    if (!dir || !s_open) return;
+    if (i == 0) MenuHandleKey(dir > 0 ? SDL_SCANCODE_RIGHT : SDL_SCANCODE_LEFT);
+    else MenuHandleKey(dir > 0 ? SDL_SCANCODE_DOWN : SDL_SCANCODE_UP);   // Y positif vers le bas dans SDL
     if (!s_open) s_padHold = true;
 }
 

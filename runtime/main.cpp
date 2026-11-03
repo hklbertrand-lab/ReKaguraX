@@ -346,6 +346,7 @@ int main(int argc, char** argv)
             else if (e.type == SDL_EVENT_GAMEPAD_ADDED) SDL_OpenGamepad(e.gdevice.which);
             else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN)
                 MenuHandlePad(e.gbutton.button, SDL_GetGamepadFromID(e.gbutton.which));
+            else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) MenuHandlePadAxis(e.gaxis.axis, e.gaxis.value);
         }
     }
     SDL_Quit();

@@ -23,6 +23,7 @@ bool MenuOpen();
 bool MenuHandleKey(int scancode);          // true si la touche a été consommée
 struct SDL_Gamepad;
 void MenuHandlePad(int button, SDL_Gamepad* pad);   // bouton de manette enfoncé (L3+R3 : menu)
+void MenuHandlePadAxis(int axis, int value);         // stick gauche dans le menu
 bool MenuBlocksPad(bool anyPressed);       // true : ne pas transmettre la manette au jeu
 // Dessine le menu dans des pixels BGRA (largeur x hauteur fixes) ; renvoie false si rien à afficher
 bool MenuRender(uint32_t* pixels, int width, int height);
