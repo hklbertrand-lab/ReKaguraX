@@ -123,7 +123,10 @@ bool MenuHandleKey(int scancode)
 }
 
 // Manette : L3+R3 ouvre/ferme le menu ; croix ou stick gauche pour naviguer, A valide, B ferme
-static std::atomic<bool> s_padHold;   // menu fermé à la manette : entrées bloquées jusqu'au relâchement
+// Menu fermé à la manette : entrées ignorées encore un court instant, pour que le bouton qui ferme ne parte pas au
+// jeu. Délai fixe et non "jusqu'au relâchement" : à deux joueurs, un tir maintenu en continu bloquait les manettes.
+static std::atomic<uint64_t> s_padHoldUntil;
+static void HoldPad() { s_padHoldUntil = SDL_GetTicks() + 300; }
 
 void MenuHandlePad(int button, SDL_Gamepad* pad)
 {
@@ -131,7 +134,7 @@ void MenuHandlePad(int button, SDL_Gamepad* pad)
         (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK && pad && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK)))
     {
         s_open = !s_open;
-        s_padHold = true;
+        HoldPad();
         return;
     }
     if (!s_open) return;
@@ -144,7 +147,7 @@ void MenuHandlePad(int button, SDL_Gamepad* pad)
     case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_START: MenuHandleKey(SDL_SCANCODE_ESCAPE); break;
     default: break;
     }
-    if (!s_open) s_padHold = true;
+    if (!s_open) HoldPad();
 }
 
 // Stick gauche : une impulsion par poussée franche (seuil haut), réarmée près du centre (seuil bas)
@@ -159,15 +162,13 @@ void MenuHandlePadAxis(int axis, int value)
     if (!dir || !s_open) return;
     if (i == 0) MenuHandleKey(dir > 0 ? SDL_SCANCODE_RIGHT : SDL_SCANCODE_LEFT);
     else MenuHandleKey(dir > 0 ? SDL_SCANCODE_DOWN : SDL_SCANCODE_UP);   // Y positif vers le bas dans SDL
-    if (!s_open) s_padHold = true;
+    if (!s_open) HoldPad();
 }
 
-// Le jeu ne voit pas la manette pendant le menu, ni juste après tant qu'un bouton reste enfoncé
-bool MenuBlocksPad(bool anyPressed)
+// Le jeu ne voit pas la manette pendant le menu, ni dans les 300 ms qui suivent sa fermeture
+bool MenuBlocksPad()
 {
-    if (s_open) return true;
-    if (s_padHold && !anyPressed) s_padHold = false;
-    return s_padHold;
+    return s_open || SDL_GetTicks() < s_padHoldUntil;
 }
 
 bool MenuRender(uint32_t* pixels, int width, int height)

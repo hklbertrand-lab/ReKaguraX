@@ -752,17 +752,17 @@ KFUNC(XamLoaderTerminateTitle) { KLOG("XamLoaderTerminateTitle"); exit(0); }
 
 static SDL_Gamepad* Pad(uint32_t index)
 {
-    static SDL_Gamepad* pads[4];
+    // Appelée depuis plusieurs threads du jeu : la n-ième manette branchée, ouverte une fois et jamais refermée
+    // (refermer une manette pendant qu'un autre thread la lit la rendait muette pour toute la suite de la partie)
     if (index >= 4) return nullptr;
-    if (pads[index] && !SDL_GamepadConnected(pads[index])) { SDL_CloseGamepad(pads[index]); pads[index] = nullptr; }   // débranchée
-    if (!pads[index])
-    {
-        int count = 0;
-        SDL_JoystickID* ids = SDL_GetGamepads(&count);
-        if (ids && (int)index < count) pads[index] = SDL_OpenGamepad(ids[index]);
-        SDL_free(ids);
-    }
-    return pads[index];
+    static std::mutex m;
+    std::lock_guard lock(m);
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    SDL_Gamepad* p = nullptr;
+    if (ids && (int)index < count && !(p = SDL_GetGamepadFromID(ids[index]))) p = SDL_OpenGamepad(ids[index]);
+    SDL_free(ids);
+    return p;
 }
 
 // Clavier = manette virtuelle du joueur 1 (toujours connectée) : Entrée=START, Échap=BACK, flèches=croix,
@@ -838,7 +838,7 @@ KFUNC(XamInputGetState)   // (user, flags, state)
     for (auto& m : map) if (SDL_GetGamepadButton(p, m.sdl)) padButtons |= m.x;
     auto axis = [&](SDL_GamepadAxis a, bool invert) { int v = SDL_GetGamepadAxis(p, a); return uint16_t(invert ? std::min(32767, -v) : v); };
     Wr32(s, ++packet);
-    if (MenuBlocksPad(padButtons != 0))   // menu ouvert (ou tout juste fermé) : manette au repos pour le jeu
+    if (MenuBlocksPad())   // menu ouvert (ou tout juste fermé) : manette au repos pour le jeu
     {
         memset(g_base + s + 4, 0, 12);
         Wr16(s + 4, b);
