@@ -289,7 +289,7 @@ int main(int argc, char** argv)
     {
         int seconds = std::max(1, atoi(prof));
         std::thread([seconds] {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
+            std::this_thread::sleep_for(std::chrono::seconds(getenv("IKARUGA_PROFILE_AT") ? atoi(getenv("IKARUGA_PROFILE_AT")) : 60));
             extern uint64_t g_presentCount;
             uint64_t frames0 = g_presentCount;
             KLOG("profilage pendant %d s", seconds);

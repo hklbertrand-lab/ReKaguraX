@@ -111,7 +111,9 @@ bool InterruptsDeliver(uint32_t cpu, uint32_t callback, uint32_t source, uint32_
     l.unlock();
     KernelWakeWaiters();
     l.lock();
-    if (!s_doneCv.wait_for(l, std::chrono::milliseconds(20), [&] { return p.taken; }))
+    // 2 ms au plus : au-delà l'émetteur (vblank, GPU) exécute lui-même le gestionnaire. Avec 20 ms, un thread
+    // du CPU visé occupé ailleurs décalait toute la cadence de vblank (images de 30 à 75 ms en fin de partie)
+    if (!s_doneCv.wait_for(l, std::chrono::milliseconds(2), [&] { return p.taken; }))
     {
         // Personne n'a pris l'interruption à temps : on la retire et l'appelant l'exécute
         auto& q = s_queues[cpu];

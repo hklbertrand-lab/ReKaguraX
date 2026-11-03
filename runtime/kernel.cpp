@@ -961,6 +961,7 @@ KFUNC(VdEnableRingBufferRPtrWriteBack) { GpuEnableReadPointerWriteBack(ARG(3)); 
 
 // Interruption verticale (60 Hz) : appelle le callback graphique du jeu
 static std::atomic<uint32_t> s_gfxCallback, s_gfxCallbackCtx;
+std::atomic<uint32_t> g_vblankCount;
 KFUNC(VdSetGraphicsInterruptCallback)
 {
     s_gfxCallback = ARG(3); s_gfxCallbackCtx = ARG(4);
@@ -971,12 +972,17 @@ KFUNC(VdSetGraphicsInterruptCallback)
             PPCContext ctx;
             GuestInitThreadContext(ctx, 0x10000);
             DebugRegisterThread("vblank");
+            // La cadence de tout le jeu en dépend et le thread ne travaille presque pas : priorité maximale, sinon
+            // l'ordonnanceur (4 cœurs chargés) le réveille parfois 10-20 ms trop tard et des images ratent leur vblank
+            SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
             auto next = std::chrono::steady_clock::now();
+            extern std::atomic<uint32_t> g_vblankCount;
             static const int periodUs = getenv("IKARUGA_VBLANK_US") ? atoi(getenv("IKARUGA_VBLANK_US")) : 16667;   // débogage
             for (;;)
             {
                 next += std::chrono::microseconds(periodUs);
                 std::this_thread::sleep_until(next);
+                g_vblankCount++;
                 static bool timing = getenv("IKARUGA_TIMING");
                 if (timing)
                 {
@@ -1021,8 +1027,16 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
         double ms = std::chrono::duration<double, std::milli>(now - prev).count(); prev = now;
         hist[std::min(3, int(ms / 16.667 + 0.5) > 0 ? int(ms / 16.667 + 0.5) - 1 : 0)]++;
         extern uint32_t g_statPipelines, g_statTextures, g_statTextureKb;
+        extern std::atomic<uint64_t> g_gpuWaitUs[4];
+        static uint64_t lastWait[4];
+        uint64_t dw[4];
+        for (int i = 0; i < 4; i++) { uint64_t v = g_gpuWaitUs[i].load(); dw[i] = v - lastWait[i]; lastWait[i] = v; }
+        extern std::atomic<uint32_t> g_vblankCount;
+        static uint32_t lastVbl;
+        uint32_t vbl = g_vblankCount - lastVbl; lastVbl = g_vblankCount;
         if (ms > 25 && s_frames > 300)
-            KLOG("à-coup image %llu : %.1f ms (pipelines %u, textures %u / %u Ko)", (unsigned long long)s_frames.load(), ms, g_statPipelines, g_statTextures, g_statTextureKb);
+            KLOG("à-coup image %llu : %.1f ms, %u vblanks (pipelines %u, textures %u / %u Ko) GPU : flip %.1f ms, interruptions %.1f ms",
+                (unsigned long long)s_frames.load(), ms, vbl, g_statPipelines, g_statTextures, g_statTextureKb, dw[0] / 1000.0, dw[1] / 1000.0);
         g_statPipelines = g_statTextures = g_statTextureKb = 0;
         if (s_frames % 600 == 0) { KLOG("intervalles VdSwap : 1 vbl %u, 2 vbl %u, 3 vbl %u, plus %u", hist[0], hist[1], hist[2], hist[3]); memset(hist, 0, sizeof(hist)); }
     }

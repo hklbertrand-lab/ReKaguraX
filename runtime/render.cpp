@@ -103,6 +103,35 @@ static VkDeviceMemory Allocate(VkMemoryRequirements req, VkMemoryPropertyFlags f
     return mem;
 }
 
+// Mémoire des images : sous-allocation linéaire dans des blocs de 64 Mo par type de mémoire (les images ne sont
+// jamais libérées). Un vkAllocateMemory par texture coûtait ~1 ms : 30 nouvelles textures dans une image (explosions,
+// ennemis qui apparaissent) faisaient rater 2 ou 3 vblanks.
+static void BindImageMemory(VkImage image)
+{
+    struct Block { VkDeviceMemory memory; VkDeviceSize used, size; };
+    static std::unordered_map<uint32_t, Block> blocks;   // type de mémoire -> bloc courant
+    static constexpr VkDeviceSize kBlock = 64ull << 20;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(s_dev, image, &req);
+    uint32_t type = VulkanFindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (req.size > kBlock / 4)   // très grande image : allocation dédiée
+    {
+        vkBindImageMemory(s_dev, image, Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), 0);
+        return;
+    }
+    Block& b = blocks[type];
+    VkDeviceSize at = (b.used + req.alignment - 1) & ~(req.alignment - 1);
+    if (!b.memory || at + req.size > b.size)
+    {
+        VkMemoryRequirements whole = req;
+        whole.size = kBlock;
+        b = { Allocate(whole, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), 0, kBlock };
+        at = 0;
+    }
+    vkBindImageMemory(s_dev, image, b.memory, at);
+    b.used = at + req.size;
+}
+
 static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage, VkFormat format = VK_FORMAT_R8G8B8A8_UNORM,
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT)
 {
@@ -120,8 +149,7 @@ static Image CreateImage(uint32_t w, uint32_t h, VkImageUsageFlags usage, VkForm
     vkCreateImage(s_dev, &ci, nullptr, &img.image);
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(s_dev, img.image, &req);
-    img.memory = Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vkBindImageMemory(s_dev, img.image, img.memory, 0);
+    BindImageMemory(img.image);
     VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     vi.image = img.image;
     vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -927,8 +955,7 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
         vkCreateImage(s_dev, &ci, nullptr, &t.image.image);
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(s_dev, t.image.image, &req);
-        t.image.memory = Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkBindImageMemory(s_dev, t.image.image, t.image.memory, 0);
+        BindImageMemory(t.image.image);
         uint32_t sw = (f[3] >> 1) & 0xFFF;
         VkImageViewCreateInfo vi{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = t.image.image;
