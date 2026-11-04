@@ -242,6 +242,8 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, CrashHandler);
 #endif
+    // IKARUGA_LOGFILE=chemin : journal dans un fichier (sous Proton, stderr ne sort pas)
+    if (const char* log = getenv("IKARUGA_LOGFILE")) if (freopen(log, "w", stderr)) setvbuf(stderr, nullptr, _IOLBF, 4096);
     if (argc > 1) g_gameDir = argv[1];
     if (!ReserveGuestMemory()) { fprintf(stderr, "Impossible de réserver 4 Go de mémoire invitée\n"); return 1; }
     if (!LoadExecutable()) { fprintf(stderr, "default.xex introuvable dans %s\n", g_gameDir.string().c_str()); return 1; }

@@ -31,7 +31,7 @@ enum : uint32_t
     PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082,
     RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206,
     RB_MODECONTROL = 0x2208, RB_COPY_CONTROL = 0x2318, RB_COLOR_CLEAR = 0x231E,
-    RB_DEPTH_INFO = 0x2002, RB_DEPTHCONTROL = 0x2200, PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114,
+    RB_DEPTH_INFO = 0x2002, RB_DEPTHCONTROL = 0x2200, PA_CL_CLIP_CNTL = 0x2204, PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114,
     RB_COPY_DEST_BASE = 0x2319, RB_COPY_DEST_PITCH = 0x231A, RB_DEPTH_CLEAR = 0x231D,
     ALU_CONSTANTS = 0x4000, FETCH_CONSTANTS = 0x4800, BOOL_CONSTANTS = 0x4900,
 };
@@ -117,7 +117,10 @@ static VkDeviceMemory Allocate(VkMemoryRequirements req, VkMemoryPropertyFlags f
     info.allocationSize = req.size;
     info.memoryTypeIndex = VulkanFindMemoryType(req.memoryTypeBits, flags);
     VkDeviceMemory mem = VK_NULL_HANDLE;
-    vkAllocateMemory(s_dev, &info, nullptr, &mem);
+    VkResult res = vkAllocateMemory(s_dev, &info, nullptr, &mem);
+    static VkDeviceSize total = 0;
+    if (res != VK_SUCCESS) KLOG("rendu : allocation de %llu Mo refusée (%d), %llu Mo déjà alloués", (unsigned long long)(req.size >> 20), int(res), (unsigned long long)(total >> 20));
+    else if ((total += req.size) >> 26 != (total - req.size) >> 26) KLOG("rendu : %llu Mo de mémoire GPU alloués", (unsigned long long)(total >> 20));
     return mem;
 }
 
@@ -610,6 +613,11 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
 {
     uint32_t blend = regs[RB_BLENDCONTROL0], mask = depthOnly ? 0 : regs[RB_COLOR_MASK] & 0xF;
     uint32_t depthControl = regs[RB_DEPTHCONTROL] & 0x76;   // test, écriture, fonction
+    // Découpage en profondeur désactivé par le jeu (CLIP_DISABLE, ZCLIP_NEAR/FAR_DISABLE) : depth clamp, sinon la
+    // géométrie posée au-delà du plan lointain (sol de forêt du chapitre 1) disparaît sur RADV (Steam Deck)
+    static const bool forceClamp = getenv("IKARUGA_DEPTHCLAMP");   // débogage : partout
+    uint32_t clip = regs[PA_CL_CLIP_CNTL];
+    if (((clip >> 16) & 1) || ((clip >> 26) & 3) || forceClamp) depthControl |= 1;
     VkFormat format = s_curColor->format;
     struct Key { uint64_t vs, ps; uint32_t blend, mask, topology, spec, depthControl, format; uint64_t layoutHash; } key{
         s_vs->containerHash, s_ps->containerHash, blend, mask, uint32_t(topology), spec, depthControl, uint32_t(format),
@@ -638,6 +646,7 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;   // TODO : PA_SU_SC_MODE_CNTL
     rs.lineWidth = 1.0f;
+    rs.depthClampEnable = depthControl & 1;
     VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState att{};
@@ -919,6 +928,19 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
 {
     if ((f[0] & 3) != 2) return 0;
     static bool texLog = getenv("IKARUGA_TEXLOG");
+    static bool formatsLogged = false;
+    if (texLog && !formatsLogged)
+    {
+        // Fonctionnalités de chaque format de texture selon le pilote (comparaison entre GPU)
+        formatsLogged = true;
+        for (uint32_t fmt = 0; fmt < 64; fmt++)
+            if (VkFormat vk = TextureFormat(fmt).vk; vk != VK_FORMAT_UNDEFINED)
+            {
+                VkFormatProperties p{};
+                vkGetPhysicalDeviceFormatProperties(VulkanPhysicalDevice(), vk, &p);
+                KLOG("format %u (vk %d) : optimal %08X", fmt, int(vk), p.optimalTilingFeatures);
+            }
+    }
     if (texLog)
     {
         // Combinaisons distinctes : format, signes (3 = gamma), exp_adjust, filtres mag/min/mip, niveaux de mip
