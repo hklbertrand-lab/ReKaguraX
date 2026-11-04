@@ -560,6 +560,7 @@ static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
     // Sol de forêt : position et couleur lues toutes deux dans r1 ; la position retombait sur l'emplacement de la
     // couleur et l'entrée 0 (position) restait sans flux (NVIDIA tolère, AMD dessine tout en noir)
     uint32_t exactTaken = 0;
+    std::unordered_map<uint32_t, uint32_t> sameKeySeen;
     ForEachVertexFetch(s_vsUcode.data(), uint32_t(s_vsUcode.size()), [&](uint32_t, const uint32_t* w) {
         for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == VertexFetchKey(w) && loc < 32) exactTaken |= 1u << loc;
     });
@@ -569,7 +570,18 @@ static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
         // Correspondance par registre et composantes écrites ; à défaut, par registre seul (hors emplacements pris,
         // de préférence celui de la même adresse d'instruction)
         uint32_t location = UINT32_MAX, fetchKey = VertexFetchKey(w);
-        for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == fetchKey) location = loc;
+        // Plusieurs fetches de même clé (sol de forêt : position et couleur toutes deux dans r1, même masque) :
+        // l'adresse d'instruction départage, à défaut l'ordre d'apparition (n-ième fetch -> n-ième entrée)
+        uint32_t candidates = 0;
+        for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == fetchKey) { location = loc; candidates++; }
+        if (candidates > 1)
+        {
+            uint32_t byAddress = UINT32_MAX, nth = sameKeySeen[fetchKey]++, i = 0;
+            for (auto& [a, loc] : s_vs->fetchLocations)
+                if (a == address) for (auto& [k, l2] : s_vs->fetchRegLocations) if (k == fetchKey && l2 == loc) byAddress = loc;
+            if (byAddress != UINT32_MAX) location = byAddress;
+            else for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == fetchKey && i++ == nth) location = loc;
+        }
         if (location == UINT32_MAX)
         {
             for (auto& [k, loc] : s_vs->fetchRegLocations)
@@ -632,11 +644,8 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
 {
     uint32_t blend = regs[RB_BLENDCONTROL0], mask = depthOnly ? 0 : regs[RB_COLOR_MASK] & 0xF;
     uint32_t depthControl = regs[RB_DEPTHCONTROL] & 0x76;   // test, écriture, fonction
-    // Depth clamp toujours : le sol de forêt du chapitre 1 est posé pile sur le plan lointain (PA_CL_CLIP_CNTL ne
-    // désactive pourtant rien, 00080000) ; NVIDIA et AMDVLK le gardent, RADV (Steam Deck) l'élimine. Caméra fixe
-    // vue de dessus : pas de géométrie derrière le plan proche à craindre. IKARUGA_NOCLAMP=1 pour comparer.
-    static const bool noClamp = getenv("IKARUGA_NOCLAMP");
-    if (!noClamp) depthControl |= 1;
+    static const bool depthClamp = getenv("IKARUGA_DEPTHCLAMP");   // débogage : géométrie au-delà du plan lointain gardée
+    if (depthClamp) depthControl |= 1;
     if (g_debugNoDepth) depthControl |= 0x80;
     VkFormat format = s_curColor->format;
     struct Key { uint64_t vs, ps; uint32_t blend, mask, topology, spec, depthControl, format; uint64_t layoutHash; } key{
