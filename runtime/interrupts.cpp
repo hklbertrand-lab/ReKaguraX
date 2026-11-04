@@ -40,11 +40,24 @@ PPCContext* InterruptsCurrentContext() { return t_ctx; }
 uint32_t InterruptsCurrentCpu() { return t_ctx ? CpuOf(*t_ctx) : 99; }
 
 // db16cyc (indice "boucle d'attente" du PowerPC) : les attentes actives du jeu cèdent régulièrement le cœur ;
-// sur une machine à 4 cœurs, elles préemptaient sinon le thread GPU ou celui qui fait le vrai travail
+// sur une machine à 4 cœurs, elles préemptaient sinon le thread GPU ou celui qui fait le vrai travail.
+// Une attente qui dure plus de 0,5 ms (le thread principal qui attend l'image suivante) passe en sommeil :
+// un yield seul gardait un cœur à 100 % (17 W sur Steam Deck au lieu de ~10)
 static void SpinHint()
 {
     static thread_local uint32_t spins;
-    if ((++spins & 255) == 0) std::this_thread::yield();
+    static thread_local std::chrono::steady_clock::time_point last, streak;
+    if ((++spins & 255) != 0) return;
+    auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::microseconds(200)) streak = now;   // du vrai travail depuis la dernière fois
+    if (now - streak > std::chrono::microseconds(500))
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        last = std::chrono::steady_clock::now();
+        return;
+    }
+    last = now;
+    std::this_thread::yield();
 }
 
 void GuestPollInterrupts(PPCContext& ctx)
