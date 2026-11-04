@@ -50,6 +50,7 @@ void SettingsLoad()
         else if (sscanf(line, "fps = %d", &v) == 1) g_settings.showFps = v != 0;
         else if (sscanf(line, "fullscreen = %d", &v) == 1) g_settings.fullscreen = v != 0;
         else if (sscanf(line, "wide = %d", &v) == 1) g_settings.wide = v != 0;
+        else if (sscanf(line, "fill = %d", &v) == 1) g_settings.fill = v != 0;
     }
     fclose(f);
 }
@@ -59,15 +60,15 @@ void SettingsSave()
     FILE* f = fopen(kFile, "w");
     if (!f) return;
     fprintf(f, "# Ikaruga : réglages (F1 en jeu)\n# resolution : hauteur (720, 800, 1080, 1440, 2160)\n");
-    fprintf(f, "resolution = %d\nfullscreen = %d\nwide = %d\nfps = %d\n", kResolutions[Res(g_settings.resolution)].h,
-        g_settings.fullscreen ? 1 : 0, g_settings.wide ? 1 : 0, g_settings.showFps ? 1 : 0);
+    fprintf(f, "resolution = %d\nfullscreen = %d\nwide = %d\nfill = %d\nfps = %d\n", kResolutions[Res(g_settings.resolution)].h,
+        g_settings.fullscreen ? 1 : 0, g_settings.wide ? 1 : 0, g_settings.fill ? 1 : 0, g_settings.showFps ? 1 : 0);
     fclose(f);
 }
 
 // ---------------------------------------------------------------- menu
 
 static std::atomic<int> s_selected;
-enum { ITEM_RESOLUTION, ITEM_FULLSCREEN, ITEM_WIDE, ITEM_FPS, ITEM_CLOSE, ITEM_COUNT };
+enum { ITEM_RESOLUTION, ITEM_FULLSCREEN, ITEM_WIDE, ITEM_FILL, ITEM_FPS, ITEM_CLOSE, ITEM_COUNT };
 
 bool MenuOpen() { return s_open; }
 
@@ -99,6 +100,7 @@ static void Change(int item, int dir)
     case ITEM_RESOLUTION: g_settings.resolution = (Res(g_settings.resolution) + dir + kResolutionCount) % kResolutionCount; ApplyWindow(); break;
     case ITEM_FULLSCREEN: g_settings.fullscreen = !g_settings.fullscreen; ApplyWindow(); break;
     case ITEM_WIDE: g_settings.wide = !g_settings.wide; break;
+    case ITEM_FILL: g_settings.fill = !g_settings.fill; break;
     case ITEM_FPS: g_settings.showFps = !g_settings.showFps; break;
     case ITEM_CLOSE: s_open = false; break;
     }
@@ -190,6 +192,7 @@ bool MenuRender(uint32_t* pixels, int width, int height)
     snprintf(lines[ITEM_RESOLUTION], 64, "Resolution   < %s >", SettingsResolutionName(g_settings.resolution));
     snprintf(lines[ITEM_FULLSCREEN], 64, "Plein ecran  < %s >", g_settings.fullscreen ? "oui" : "non");
     snprintf(lines[ITEM_WIDE], 64, "Mode large   < %s >", g_settings.wide ? "oui (exp.)" : "non");
+    snprintf(lines[ITEM_FILL], 64, "Cadrage      < %s >", g_settings.fill ? "remplir (16:10)" : "bandes noires");
     snprintf(lines[ITEM_FPS], 64, "Afficher FPS < %s >", g_settings.showFps ? "oui" : "non");
     snprintf(lines[ITEM_CLOSE], 64, "Fermer");
     for (int i = 0; i < ITEM_COUNT; i++)
@@ -205,9 +208,9 @@ bool MenuRender(uint32_t* pixels, int width, int height)
         SDL_RenderDebugText(r, 12, y, lines[i]);
     }
     SDL_SetRenderDrawColor(r, 140, 140, 150, 255);
-    SDL_RenderDebugText(r, 12, 102, "Fleches : choisir/changer  Echap : fermer");
-    SDL_RenderDebugText(r, 12, 112, "F1 : menu   F11 / Alt+Entree : plein ecran");
-    SDL_RenderDebugText(r, 12, 122, "Manette: L3+R3 menu  A changer  B fermer");
+    SDL_RenderDebugText(r, 12, 116, "Fleches : choisir/changer  Echap : fermer");
+    SDL_RenderDebugText(r, 12, 126, "F1 : menu   F11 / Alt+Entree : plein ecran");
+    SDL_RenderDebugText(r, 12, 136,"Manette: L3+R3 menu  A changer  B fermer");
     SDL_RenderPresent(r);
     SDL_DestroyRenderer(r);
     SDL_DestroySurface(surface);

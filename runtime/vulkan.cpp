@@ -281,13 +281,22 @@ void VulkanPresentFrame(VkImage src, uint32_t width, uint32_t height)
     vkCmdClearColorImage(s_cmd, s_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     if (src)
     {
-        // Conserve le rapport d'aspect de l'image du jeu
-        float scale = std::min(float(s_extent.width) / width, float(s_extent.height) / height);
-        int32_t w = int32_t(width * scale), h = int32_t(height * scale);
+        // Conserve le rapport d'aspect de l'image du jeu. Écran plus étroit que l'image (16:10 du Steam Deck) et
+        // cadrage "remplir" : la hauteur remplit l'écran et les bords des panneaux latéraux sont rognés, 10 % de la
+        // largeur au plus de chaque côté (16:10 exactement), au-delà des bandes noires reviennent en haut et en bas
+        int32_t sx = 0, sw = int32_t(width);
+        if (g_settings.fill && float(s_extent.width) / s_extent.height < float(width) / height)
+        {
+            sw = std::max(int32_t(width * 0.8f), int32_t(float(height) * s_extent.width / s_extent.height));
+            sx = (int32_t(width) - sw) / 2;
+        }
+        float scale = std::min(float(s_extent.width) / sw, float(s_extent.height) / height);
+        int32_t w = int32_t(sw * scale), h = int32_t(height * scale);
         int32_t x = (int32_t(s_extent.width) - w) / 2, y = (int32_t(s_extent.height) - h) / 2;
         VkImageBlit blit{};
         blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        blit.srcOffsets[1] = { int32_t(width), int32_t(height), 1 };
+        blit.srcOffsets[0] = { sx, 0, 0 };
+        blit.srcOffsets[1] = { sx + sw, int32_t(height), 1 };
         blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         blit.dstOffsets[0] = { x, y, 0 };
         blit.dstOffsets[1] = { x + w, y + h, 1 };
