@@ -9,6 +9,7 @@
 #include "shaders.h"
 #include "vulkan.h"
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <string>
 #include <cmath>
@@ -53,6 +54,8 @@ static bool s_wideFieldThisFrame = false;   // une zone de jeu large a été cop
 static inline uint32_t S(uint32_t v) { return uint32_t(v * s_scale + 0.5f); }
 static inline int32_t S(int32_t v) { return int32_t(v * s_scale + (v >= 0 ? 0.5f : -0.5f)); }
 static constexpr VkDeviceSize kUploadSize = 64 << 20;
+extern std::atomic<uint64_t> g_dumpFrame;   // débogage en jeu (F9/F10, RenderDraw)
+extern std::atomic<bool> g_debugNoDepth;
 
 struct Image
 {
@@ -553,14 +556,30 @@ static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
     bool ok = true;
     // Un mini-fetch (dword 1 bit 30) n'a ni constante de fetch ni pas : il reprend ceux du dernier fetch complet
     uint32_t lastConst = 0, lastStride = 0;
+    // Emplacements déjà pris par une correspondance exacte : un repli par registre seul ne doit pas y retomber.
+    // Sol de forêt : position et couleur lues toutes deux dans r1 ; la position retombait sur l'emplacement de la
+    // couleur et l'entrée 0 (position) restait sans flux (NVIDIA tolère, AMD dessine tout en noir)
+    uint32_t exactTaken = 0;
+    ForEachVertexFetch(s_vsUcode.data(), uint32_t(s_vsUcode.size()), [&](uint32_t, const uint32_t* w) {
+        for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == VertexFetchKey(w) && loc < 32) exactTaken |= 1u << loc;
+    });
     ForEachVertexFetch(s_vsUcode.data(), uint32_t(s_vsUcode.size()), [&](uint32_t address, const uint32_t* w) {
         bool mini = (w[1] >> 30) & 1;
         if (!mini) { lastConst = ((w[0] >> 20) & 0x1F) * 3 + ((w[0] >> 25) & 3); lastStride = (w[2] & 0xFF) * 4; }
-        // Correspondance par registre et composantes écrites ; à défaut, par registre seul
+        // Correspondance par registre et composantes écrites ; à défaut, par registre seul (hors emplacements pris,
+        // de préférence celui de la même adresse d'instruction)
         uint32_t location = UINT32_MAX, fetchKey = VertexFetchKey(w);
         for (auto& [k, loc] : s_vs->fetchRegLocations) if (k == fetchKey) location = loc;
         if (location == UINT32_MAX)
-            for (auto& [k, loc] : s_vs->fetchRegLocations) if ((k & 0xFF) == (fetchKey & 0xFF)) location = loc;
+        {
+            for (auto& [k, loc] : s_vs->fetchRegLocations)
+                if ((k & 0xFF) == (fetchKey & 0xFF) && !(loc < 32 && (exactTaken >> loc) & 1)) location = loc;
+            for (auto& [a, loc] : s_vs->fetchLocations)
+                if (a == address && !(loc < 32 && (exactTaken >> loc) & 1))
+                    for (auto& [k, l2] : s_vs->fetchRegLocations) if (l2 == loc && (k & 0xFF) == (fetchKey & 0xFF)) location = loc;
+            if (location == UINT32_MAX)   // ancien repli
+                for (auto& [k, loc] : s_vs->fetchRegLocations) if ((k & 0xFF) == (fetchKey & 0xFF)) location = loc;
+        }
         static bool flog = getenv("IKARUGA_FETCHLOG");
         if (flog)
         {
@@ -618,6 +637,7 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     // vue de dessus : pas de géométrie derrière le plan proche à craindre. IKARUGA_NOCLAMP=1 pour comparer.
     static const bool noClamp = getenv("IKARUGA_NOCLAMP");
     if (!noClamp) depthControl |= 1;
+    if (g_debugNoDepth) depthControl |= 0x80;
     VkFormat format = s_curColor->format;
     struct Key { uint64_t vs, ps; uint32_t blend, mask, topology, spec, depthControl, format; uint64_t layoutHash; } key{
         s_vs->containerHash, s_ps->containerHash, blend, mask, uint32_t(topology), spec, depthControl, uint32_t(format),
@@ -666,7 +686,7 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
     VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
     dss.depthTestEnable = (depthControl >> 1) & 1;
     static const bool noDepth = getenv("IKARUGA_NODEPTH");   // débogage
-    if (noDepth) dss.depthTestEnable = false;
+    if (noDepth || (depthControl & 0x80)) dss.depthTestEnable = false;
     dss.depthWriteEnable = dss.depthTestEnable && ((depthControl >> 2) & 1);
     static const VkCompareOp ops[] = { VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL,
         VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS };
@@ -1130,12 +1150,17 @@ static uint32_t GetSampler(const uint32_t* f)
 
 // ------------------------------------------------------------------ dessin
 
+// Débogage en jeu : F10 -> structure complète de l'image suivante dans le journal, F9 -> test de profondeur coupé
+std::atomic<uint64_t> g_dumpFrame{ 0 };
+std::atomic<bool> g_debugNoDepth{ false };
+static bool DumpFrame() { extern uint64_t g_presentCount; return g_dumpFrame && g_presentCount == g_dumpFrame; }
+
 void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint32_t), uint32_t dmaBase, uint32_t dmaSize)
 {
     static int logged;
     static uint64_t drawFrom = getenv("IKARUGA_DRAWLOG") ? strtoull(getenv("IKARUGA_DRAWLOG"), nullptr, 10) : 0;
     extern uint64_t g_presentCount;
-    if (drawFrom && g_presentCount >= drawFrom && logged++ < 400)
+    if ((drawFrom && g_presentCount >= drawFrom && logged++ < 400) || DumpFrame())
         KLOG("RenderDraw init=%08X mode=%u vs=%016llx ps=%016llx copy=%08X clear=%08X", initiator, regs[RB_MODECONTROL] & 7,
             s_vs ? (unsigned long long)s_vs->containerHash : 0ull, s_ps ? (unsigned long long)s_ps->containerHash : 0ull,
             regs[RB_COPY_CONTROL], regs[RB_COLOR_CLEAR]);
@@ -1148,7 +1173,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         // Débogage : dessins perdus faute de shader traduit (IKARUGA_DRAWTEX=n)
         extern uint64_t g_presentCount;
         static uint64_t texFrom = getenv("IKARUGA_DRAWTEX") ? strtoull(getenv("IKARUGA_DRAWTEX"), nullptr, 10) : 0;
-        if (texFrom && g_presentCount == texFrom)
+        if ((texFrom && g_presentCount == texFrom) || DumpFrame())
         {
             const uint32_t* f = regs + FETCH_CONSTANTS;
             KLOG("dessin perdu (vs %s, ps %s) prim %u, %u sommets, texture 0 : base %08X format %u %ux%u", s_vs ? "ok" : "absent", s_ps ? "ok" : "absent",
@@ -1158,7 +1183,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     }
 
     uint32_t prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
-    if (source == 1) { static int warned; if (!warned++) KLOG("rendu : index immédiats non gérés"); return; }
+    if (source == 1) { static int warned; if (!warned++ || DumpFrame()) KLOG("rendu : index immédiats non gérés"); return; }
 
     // Index en mémoire (source DMA) : 16 ou 32 bits, ordre des octets dans VGT_DMA_SIZE[31:30], décalage VGT_INDX_OFFSET
     bool indexed = source == 0;
@@ -1180,11 +1205,11 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
             guestIndices[i] = v;
         }
         fetchCount = count ? maxIndex + 1 : 0;
-        if (prim == 8) { static int warned; if (!warned++) KLOG("rendu : rectangles indexés non gérés"); return; }
+        if (prim == 8) { static int warned; if (!warned++ || DumpFrame()) KLOG("rendu : rectangles indexés non gérés"); return; }
     }
 
     VertexLayout layout{};   // zéro : la clé des pipelines hache aussi les entrées inutilisées
-    if (!DecodeVertexLayout(regs, layout)) return;
+    if (!DecodeVertexLayout(regs, layout)) { if (DumpFrame()) KLOG("dessin perdu : disposition des sommets"); return; }
 
     VkPrimitiveTopology topology;
     std::vector<uint32_t> indices;
@@ -1207,7 +1232,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         break;
     case 8:    // liste de rectangles : le 4e sommet est déduit (v1 + v2 - v0), ce qui exige des attributs float32
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        if (!layout.allFloat32) { static int warned; if (!warned++) KLOG("rendu : rectangles avec attributs non float32"); return; }
+        if (!layout.allFloat32) { static int warned; if (!warned++ || DumpFrame()) KLOG("rendu : rectangles avec attributs non float32"); return; }
         break;
     default:
         { static int warned; if (!warned++) KLOG("rendu : primitive %u non gérée", prim); }
@@ -1254,6 +1279,18 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         }
         else
             for (uint32_t i = 0; i < bytes / 4; i++) dst[i] = __builtin_bswap32(((const uint32_t*)src)[i]);
+        if (DumpFrame())
+        {
+            std::string attrs;
+            for (uint32_t a = 0; a < layout.attributeCount; a++)
+                if (layout.attributes[a].binding == layout.bindings[b].binding)
+                {
+                    char t[48]; snprintf(t, sizeof t, " [loc %u vk %d +%u]", layout.attributes[a].location, int(layout.attributes[a].format), layout.attributes[a].offset);
+                    attrs += t;
+                }
+            KLOG("  sommets flux %u : base %08X pas %u taille %u, 1er sommet %08X %08X %08X %08X %08X %08X %08X %08X%s", b, base, stride, sizeBytes,
+                dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7], attrs.c_str());
+        }
         buffers[b] = s_upload;
         offsets[b] = at;
     }
@@ -1291,7 +1328,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         uint32_t tex = GetTexture(f, phys), smp = GetSampler(f);
         extern uint64_t g_presentCount;
         static uint64_t texFrom = getenv("IKARUGA_DRAWTEX") ? strtoull(getenv("IKARUGA_DRAWTEX"), nullptr, 10) : 0;
-        if (texFrom && g_presentCount == texFrom)
+        if ((texFrom && g_presentCount == texFrom) || DumpFrame())
             KLOG("dessin ps %016llx emplacement %u : base %08X format %u %ux%u swizzle %03X adressage %o -> descripteur %u sampler %u",
                 (unsigned long long)s_ps->containerHash, slot, (f[1] >> 12) << 12, f[1] & 0x3F, (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1, (f[3] >> 1) & 0xFFF, (f[0] >> 10) & 0x1FF, tex, smp);
         memcpy(shared + slot * 4, &tex, 4);
@@ -1328,7 +1365,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
     if ((colorControl & 8) && (s_ps->specConstantsMask & 2)) spec |= 2;   // test alpha (fonction "supérieur ou égal" supposée)
     BeginTargets(regs);
     VkPipeline pipeline = GetPipeline(regs, layout, topology, spec | ((s_vs->specConstantsMask & 1) && layout.packedNormal ? 1 : 0), edramMode == 5);
-    if (!pipeline) return;
+    if (!pipeline) { if (DumpFrame()) KLOG("dessin perdu : pipeline"); return; }
     uint32_t tw = s_curColor->width, th = s_curColor->height;
 
     // Viewport Xenos (échelle/décalage) ; une hauteur négative retourne l'axe Y comme D3D
@@ -1388,7 +1425,7 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         // Débogage : IKARUGA_PASSLOG=n -> structure de l'image n (cible, shaders, viewport, textures copiées lues)
         extern uint64_t g_presentCount;
         static uint64_t passFrom = getenv("IKARUGA_PASSLOG") ? strtoull(getenv("IKARUGA_PASSLOG"), nullptr, 10) : 0;
-        if (passFrom && g_presentCount == passFrom)
+        if ((passFrom && g_presentCount == passFrom) || DumpFrame())
         {
             std::string tex;
             for (uint32_t slot = 0; slot < 16; slot++)
@@ -1398,8 +1435,8 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
                 uint32_t b = (f[1] >> 12) << 12 & 0x1FFFFFFF;
                 if (s_resolved.count(b)) { char t[32]; snprintf(t, sizeof t, " t%u=%08X", slot, b); tex += t; }
             }
-            KLOG("passe cible %ux%u fmt %d vs %016llx ps %016llx vp (%.0f,%.0f %.0fx%.0f) sc (%d,%d %ux%u) prim %u n %u%s",
-                s_curColor->width, s_curColor->height, int(s_curColor->format), (unsigned long long)s_vs->containerHash, (unsigned long long)s_ps->containerHash,
+            KLOG("passe depth %02X z %.3f-%.3f cible %ux%u fmt %d vs %016llx ps %016llx vp (%.0f,%.0f %.0fx%.0f) sc (%d,%d %ux%u) prim %u n %u%s",
+                regs[RB_DEPTHCONTROL] & 0x77, viewport.minDepth, viewport.maxDepth, s_curColor->width, s_curColor->height, int(s_curColor->format), (unsigned long long)s_vs->containerHash, (unsigned long long)s_ps->containerHash,
                 viewport.x, viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height,
                 initiator & 0x3F, initiator >> 16, tex.c_str());
         }

@@ -110,6 +110,15 @@ static void Change(int item, int dir)
 bool MenuHandleKey(int scancode)
 {
     if (scancode == SDL_SCANCODE_F1) { s_open = !s_open; return true; }
+    if (scancode == SDL_SCANCODE_F9 || scancode == SDL_SCANCODE_F10)
+    {
+        // Débogage : F9 coupe/rétablit le test de profondeur, F10 décrit l'image suivante dans le journal
+        extern std::atomic<uint64_t> g_dumpFrame; extern std::atomic<bool> g_debugNoDepth; extern uint64_t g_presentCount;
+        if (scancode == SDL_SCANCODE_F9) g_debugNoDepth = !g_debugNoDepth;
+        else g_dumpFrame = g_presentCount + 2;
+        fprintf(stderr, "[k] débogage : %s\n", scancode == SDL_SCANCODE_F9 ? (g_debugNoDepth ? "profondeur coupée" : "profondeur rétablie") : "image suivante décrite");
+        return true;
+    }
     if (scancode == SDL_SCANCODE_F11) { g_settings.fullscreen = !g_settings.fullscreen; ApplyWindow(); SettingsSave(); return true; }
     if (!s_open) return false;
     switch (scancode)
