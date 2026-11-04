@@ -31,7 +31,7 @@ enum : uint32_t
     PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082,
     RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206,
     RB_MODECONTROL = 0x2208, RB_COPY_CONTROL = 0x2318, RB_COLOR_CLEAR = 0x231E,
-    RB_DEPTH_INFO = 0x2002, RB_DEPTHCONTROL = 0x2200, PA_CL_CLIP_CNTL = 0x2204, PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114,
+    RB_DEPTH_INFO = 0x2002, RB_DEPTHCONTROL = 0x2200, PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114,
     RB_COPY_DEST_BASE = 0x2319, RB_COPY_DEST_PITCH = 0x231A, RB_DEPTH_CLEAR = 0x231D,
     ALU_CONSTANTS = 0x4000, FETCH_CONSTANTS = 0x4800, BOOL_CONSTANTS = 0x4900,
 };
@@ -613,11 +613,11 @@ static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, 
 {
     uint32_t blend = regs[RB_BLENDCONTROL0], mask = depthOnly ? 0 : regs[RB_COLOR_MASK] & 0xF;
     uint32_t depthControl = regs[RB_DEPTHCONTROL] & 0x76;   // test, écriture, fonction
-    // Découpage en profondeur désactivé par le jeu (CLIP_DISABLE, ZCLIP_NEAR/FAR_DISABLE) : depth clamp, sinon la
-    // géométrie posée au-delà du plan lointain (sol de forêt du chapitre 1) disparaît sur RADV (Steam Deck)
-    static const bool forceClamp = getenv("IKARUGA_DEPTHCLAMP");   // débogage : partout
-    uint32_t clip = regs[PA_CL_CLIP_CNTL];
-    if (((clip >> 16) & 1) || ((clip >> 26) & 3) || forceClamp) depthControl |= 1;
+    // Depth clamp toujours : le sol de forêt du chapitre 1 est posé pile sur le plan lointain (PA_CL_CLIP_CNTL ne
+    // désactive pourtant rien, 00080000) ; NVIDIA et AMDVLK le gardent, RADV (Steam Deck) l'élimine. Caméra fixe
+    // vue de dessus : pas de géométrie derrière le plan proche à craindre. IKARUGA_NOCLAMP=1 pour comparer.
+    static const bool noClamp = getenv("IKARUGA_NOCLAMP");
+    if (!noClamp) depthControl |= 1;
     VkFormat format = s_curColor->format;
     struct Key { uint64_t vs, ps; uint32_t blend, mask, topology, spec, depthControl, format; uint64_t layoutHash; } key{
         s_vs->containerHash, s_ps->containerHash, blend, mask, uint32_t(topology), spec, depthControl, uint32_t(format),

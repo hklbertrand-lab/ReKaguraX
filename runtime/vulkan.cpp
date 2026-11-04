@@ -161,7 +161,7 @@ bool VulkanInit(SDL_Window* window)
     f2.pNext = &f12;
     f2.features.shaderInt64 = VK_TRUE;
     f2.features.samplerAnisotropy = VK_TRUE;
-    f2.features.depthClamp = VK_TRUE;   // découpage en profondeur désactivé par le jeu (PA_CL_CLIP_CNTL)
+    f2.features.depthClamp = VK_TRUE;   // sol de forêt sur le plan lointain (render.cpp, GetPipeline)
     VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
