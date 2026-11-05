@@ -6,7 +6,7 @@ URL=https://github.com/hklbertrand-lab/ReKaguraX.git
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 W="$(mktemp -d)"
-cleanup() { git worktree remove --force "$W" 2>/dev/null || true; git branch -D rkx-split >/dev/null 2>&1 || true; git update-ref -d refs/remotes/rkx/main 2>/dev/null || true; }
+cleanup() { cd "$ROOT"; git worktree remove --force "$W" 2>/dev/null || true; git branch -D rkx-split >/dev/null 2>&1 || true; git update-ref -d refs/remotes/rkx/main 2>/dev/null || true; }
 trap cleanup EXIT
 git fetch -q "$URL" main:refs/remotes/rkx/main
 git subtree split -q --prefix=Ikaruga -b rkx-split >/dev/null
