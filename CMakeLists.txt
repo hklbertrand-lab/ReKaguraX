@@ -26,8 +26,14 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${XENOS_THIRDPARTY}/zstd/build/cmake ${CMAKE_BINARY_DIR}/zstd EXCLUDE_FROM_ALL)
 
-# Runtime Xbox 360 commun (noyau, GPU Xenos -> Vulkan, audio XMA, réglages) : dossier frère, ou X360_RUNTIME_DIR
-set(X360_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../Xbox360Runtime CACHE PATH "Dossier de Xbox360Runtime")
+# Runtime Xbox 360 commun (noyau, GPU Xenos -> Vulkan, audio XMA, réglages) : copie dans le dépôt (ReKaguraX),
+# sinon dossier frère ; X360_RUNTIME_DIR pour le forcer
+if(EXISTS ${CMAKE_SOURCE_DIR}/Xbox360Runtime/runtime.cmake)
+    set(X360_RUNTIME_DEFAULT ${CMAKE_SOURCE_DIR}/Xbox360Runtime)
+else()
+    set(X360_RUNTIME_DEFAULT ${CMAKE_SOURCE_DIR}/../Xbox360Runtime)
+endif()
+set(X360_RUNTIME_DIR ${X360_RUNTIME_DEFAULT} CACHE PATH "Dossier de Xbox360Runtime")
 include(${X360_RUNTIME_DIR}/runtime.cmake)
 
 file(GLOB GAME_SOURCES ${CMAKE_SOURCE_DIR}/game/*.cpp)

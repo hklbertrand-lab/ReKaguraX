@@ -5,7 +5,8 @@
 set -e
 cd "$(dirname "$0")"
 mkdir -p thirdparty build
-RT="$(cd ../Xbox360Runtime && pwd)"   # runtime commun (dossier frère)
+# Runtime commun : copie dans le dépôt (ReKaguraX), sinon dossier frère
+if [ -d Xbox360Runtime ]; then RT="$PWD/Xbox360Runtime"; else RT="$(cd ../Xbox360Runtime && pwd)"; fi
 
 clone() { [ -d "thirdparty/$1" ] || git clone --recursive $3 "$2" "thirdparty/$1"; }
 clone XenonRecomp    https://github.com/hedge-dev/XenonRecomp
