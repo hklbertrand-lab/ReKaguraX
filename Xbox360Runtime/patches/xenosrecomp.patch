@@ -1,0 +1,215 @@
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index d015145..604392e 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -125,6 +125,13 @@ int main(int argc, char** argv)
+ 
+                 shader.specConstantsMask = recompiler.specConstantsMask;
+ 
++                // Ikaruga : garde le HLSL à côté du cache pour l'inspection (<hash>.hlsl)
++                if (FILE* hlsl = fopen(fmt::format("{}/../hlsl/{:016X}.hlsl", output, hashShaderPair.first).c_str(), "wb"))
++                {
++                    fwrite(recompiler.out.data(), 1, recompiler.out.size(), hlsl);
++                    fclose(hlsl);
++                }
++
+                 thread_local DxcCompiler dxcCompiler;
+ 
+ #ifdef XENOS_RECOMP_DXIL
+@@ -134,7 +141,13 @@ int main(int argc, char** argv)
+ #endif
+ 
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+-                assert(spirv != nullptr);
++                if (spirv == nullptr)
++                {
++                    // Ikaruga : shader non compilable (ex. textures 1D) -> ignoré et signalé
++                    fmt::println(stderr, "XenosRecomp : échec de compilation du shader {:X}", hashShaderPair.first);
++                    ++progress;
++                    return;
++                }
+ 
+                 bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+                 assert(result);
+diff --git a/XenosRecomp/pch.h b/XenosRecomp/pch.h
+index e59682c..0ac377b 100644
+--- a/XenosRecomp/pch.h
++++ b/XenosRecomp/pch.h
+@@ -5,6 +5,13 @@
+ #endif
+ 
+ #include <dxcapi.h>
++#ifdef __MINGW32__
++// MinGW : __uuidof a besoin de déclarations explicites pour les interfaces DXC
++__CRT_UUID_DECL(IDxcBlob, 0x8BA5FB08, 0x5195, 0x40e2, 0xAC, 0x58, 0x0D, 0x98, 0x9C, 0x3A, 0x01, 0x02)
++__CRT_UUID_DECL(IDxcBlobUtf8, 0x3DA636C9, 0xBA71, 0x4024, 0xA3, 0x01, 0x30, 0xCB, 0xF1, 0x25, 0x30, 0x5B)
++__CRT_UUID_DECL(IDxcResult, 0x58346CDA, 0xDDE7, 0x4497, 0x94, 0x61, 0x6F, 0x87, 0xAF, 0x5E, 0x06, 0x59)
++__CRT_UUID_DECL(IDxcCompiler3, 0x228B4687, 0x5A6A, 0x4730, 0x90, 0x0C, 0x97, 0x02, 0xB2, 0x20, 0x3F, 0x54)
++#endif
+ 
+ #include <bit>
+ #include <cassert>
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..79c3840 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -30,6 +30,8 @@ struct PushConstants
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+ #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+ #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++// Ikaruga : constantes de boucle (nombre, début, pas) remplies par le moteur à partir de l'octet 512
++#define g_LoopConst(n) vk::RawBufferLoad<int4>(g_PushConstants.SharedConstants + 512 + (n) * 16)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -62,7 +64,11 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    #ifdef XENOS_VERTEX_SHADER
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), 0);
++#else
+     return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++#endif
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -143,9 +149,20 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     return r;
+ }
+ 
++// Ikaruga : texture 1D = texture 2D d'une seule ligne
++float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
++{
++    // LOD explicite : les lectures 1D se font aussi dans des vertex shaders
++    return g_Texture2DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float2(texCoord, 0.5), 0);
++}
++
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
++#ifdef XENOS_VERTEX_SHADER
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, 0);
++#else
+     return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++#endif
+ }
+ 
+ struct CubeMapData
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..6e2f662 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -177,7 +177,22 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     out += " = ";
+ 
+     auto findResult = vertexElements.find(address);
+-    assert(findResult != vertexElements.end());
++    if (findResult == vertexElements.end())
++    {
++        // Ikaruga : fetch sans déclaration (mini-fetch / fetch partagé) -> valeur neutre, signalée
++        fmt::println(stderr, "XenosRecomp : vfetch sans déclaration à l'adresse {}", address);
++        out += "float4(0.0, 0.0, 0.0, 1.0).";
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
+ 
+     switch (findResult->second.usage)
+     {
+@@ -626,8 +641,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             default:
+             {
+                 auto findResult = interpolators.find(instr.vectorDest);
+-                assert(findResult != interpolators.end());
+-                exportRegister = findResult->second;
++                // Ikaruga : export vers un interpolateur non déclaré -> variable locale ignorée
++                exportRegister = findResult != interpolators.end() ? std::string_view(findResult->second) : std::string_view("oUnused");
+                 break;
+             }
+             }
+@@ -1098,6 +1113,12 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     }
+ }
+ 
++// Ikaruga : constante de boucle définie dans le shader (iN) ou fournie par le moteur (g_LoopConst)
++std::string ShaderRecompiler::loopConstant(uint32_t id)
++{
++    return definedLoopConstants.count(id) ? fmt::format("i{}", id) : fmt::format("g_LoopConst({})", id);
++}
++
+ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
+ {
+     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+@@ -1105,6 +1126,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    // Ikaruga : étage connu de shader_common.h (LOD explicite pour les lectures de texture en vertex shader)
++    if ((shaderContainer->flags & 0x1) != 0)
++        out += "#define XENOS_VERTEX_SHADER\n";
+     out += include;
+     out += '\n';
+ 
+@@ -1176,6 +1200,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                     constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+             }
++            // Ikaruga : les textures 1D sont des textures 2D d'une ligne (même indice que la 2D)
++            println("#define {0}_Texture1DDescriptorIndex {0}_Texture2DDescriptorIndex", constantName);
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                 constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+@@ -1408,6 +1434,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+                 value = definition->values[i].get();
+ 
++                definedLoopConstants[(definition->registerIndex - 8992) / 4 + i] = true;
+                 println("\tint4 i{} = int4({}, {}, {}, {});",
+                     (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
+             }
+@@ -1479,6 +1506,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    out += "\tfloat4 oUnused = 0.0;\n";
+     out += "\tint a0 = 0;\n";
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+@@ -1648,7 +1676,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 #ifdef UNLEASHED_RECOMP
+                     print("[unroll] ");
+                 #endif
+-                    println("for (aL = 0; aL < i{}.x; aL++)", uint32_t(cfInstr.loopStart.loopId));
++                    println("for (aL = 0; aL < {}.x; aL++)", loopConstant(cfInstr.loopStart.loopId));
+                     indent();
+                     out += "{\n";
+                     ++indentation;
+@@ -1669,7 +1697,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 else
+                 {
+                     out += "\t\t\t++aL;\n";
+-                    println("\t\t\tif (aL < i{}.x)", uint32_t(cfInstr.loopEnd.loopId));
++                    println("\t\t\tif (aL < {}.x)", loopConstant(cfInstr.loopEnd.loopId));
+                     out += "\t\t\t{\n";
+                     println("\t\t\t\tpc = {};", uint32_t(cfInstr.loopEnd.address));
+                     out += "\t\t\t\tcontinue;\n";
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..9810e41 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -32,6 +32,8 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const char*> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
++    std::unordered_map<uint32_t, bool> definedLoopConstants; // Ikaruga
++    std::string loopConstant(uint32_t id);
+     uint32_t specConstantsMask = 0;
+ 
+ #ifdef UNLEASHED_RECOMP
