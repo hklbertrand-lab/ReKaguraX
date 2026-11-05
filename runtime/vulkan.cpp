@@ -209,6 +209,10 @@ static void Barrier(VkImage image, VkImageLayout from, VkImageLayout to)
 }
 
 static bool s_recording;
+static uint64_t s_recordEpoch;
+
+// Numéro d'enregistrement du command buffer : change à chaque vkBeginCommandBuffer (état lié perdu)
+uint64_t VulkanRecordEpoch() { return s_recordEpoch; }
 
 // Command buffer de l'image en cours (enregistré par le thread GPU entre deux présentations)
 VkCommandBuffer VulkanFrameCmd()
@@ -225,6 +229,7 @@ VkCommandBuffer VulkanFrameCmd()
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(s_cmd, &begin);
         s_recording = true;
+        s_recordEpoch++;
     }
     return s_cmd;
 }

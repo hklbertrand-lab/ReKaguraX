@@ -1080,6 +1080,7 @@ KFUNC(VdSetGraphicsInterruptCallback)
 }
 
 static std::atomic<uint64_t> s_frames;
+std::atomic<uint32_t> g_slowStreak;   // VdSwap de plus de 25 ms d'affilée (profilage IKARUGA_PROFILE_AT=slow)
 KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; des NOP suffisent sans GPU
 {
     // Paquet type 3 opcode 0x64 couvrant les 64 dwords : le thread GPU présentera à ce point du flux
@@ -1091,6 +1092,13 @@ KFUNC(VdSwap)   // (cmdBuffer, ...) : le noyau remplit 64 dwords de commandes ; 
     if (s_frames % 120 == 119) GpuPrintStats();
     if (++s_frames % 60 == 1) KLOG("VdSwap : image %llu", (unsigned long long)s_frames.load());
     static bool timing = getenv("IKARUGA_TIMING");
+    {
+        // Images lentes d'affilée (IKARUGA_PROFILE_AT=slow)
+        static auto prevSwap = std::chrono::steady_clock::now();
+        auto t = std::chrono::steady_clock::now();
+        if (t - prevSwap > std::chrono::milliseconds(25)) g_slowStreak++; else g_slowStreak = 0;
+        prevSwap = t;
+    }
     if (timing)
     {
         // Histogramme des intervalles entre VdSwap (en vblanks de 16,7 ms)

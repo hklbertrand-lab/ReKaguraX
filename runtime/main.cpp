@@ -294,7 +294,14 @@ int main(int argc, char** argv)
     {
         int seconds = std::max(1, atoi(prof));
         std::thread([seconds] {
-            std::this_thread::sleep_for(std::chrono::seconds(getenv("IKARUGA_PROFILE_AT") ? atoi(getenv("IKARUGA_PROFILE_AT")) : 60));
+            // IKARUGA_PROFILE_AT=slow : démarre dès que le jeu tient 2 s à 30 img/s (120 VdSwap de plus de 25 ms d'affilée)
+            const char* at = getenv("IKARUGA_PROFILE_AT");
+            if (at && !strcmp(at, "slow"))
+            {
+                extern std::atomic<uint32_t> g_slowStreak;
+                while (g_slowStreak < 120) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            else std::this_thread::sleep_for(std::chrono::seconds(at ? atoi(at) : 60));
             extern uint64_t g_presentCount;
             uint64_t frames0 = g_presentCount;
             KLOG("profilage pendant %d s", seconds);

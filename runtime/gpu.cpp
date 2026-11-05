@@ -14,6 +14,7 @@
 #include <vector>
 
 static uint32_t s_regs[0x8000];
+std::atomic<uint64_t> g_constGen[2];   // changements des constantes ALU VS / PS
 static uint32_t s_ringBase, s_ringSize, s_rptr, s_rptrWriteBack;
 uint32_t g_gpuRptr, g_gpuLastWptr;   // débogage
 static uint32_t s_swapCounter;
@@ -82,6 +83,9 @@ void GpuDispatchInterrupt(uint32_t source, uint32_t cpu)
 static void WriteRegister(uint32_t index, uint32_t value)
 {
     if (index >= 0x8000) return;
+    // Génération des constantes ALU (VS 0x4000-0x43FF, PS 0x4400-0x47FF) : le rendu ne recompare ses ~8 Ko de
+    // constantes que si l'une d'elles a changé (render.cpp, UploadConstants)
+    if (index >= 0x4000 && index < 0x4800 && s_regs[index] != value) g_constGen[index >= 0x4400]++;
     s_regs[index] = value;
     // Le CPU lit les registres GPU via la fenêtre MMIO (ex. D3D lit dans SCRATCH 0x57C la fonction à
     // appeler lors d'une interruption) : on y reflète chaque écriture du flux de commandes

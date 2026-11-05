@@ -340,16 +340,23 @@ static VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize ali
 
 // Constantes : la plupart des dessins consécutifs gardent les mêmes ; on réutilise alors la copie précédente
 // de l'image en cours au lieu de réécrire ~9 Ko par dessin dans la mémoire partagée avec la carte
-static VkDeviceSize UploadConstants(int slot, const void* data, VkDeviceSize size)
+// gen : génération des registres sources (g_constGen) ; inchangée dans la même image -> copie précédente sans
+// comparer les octets (le memcmp de ~8 Ko par dessin pesait sur le thread GPU du Steam Deck)
+extern std::atomic<uint64_t> g_constGen[2];
+static VkDeviceSize UploadConstants(int slot, const void* data, VkDeviceSize size, uint64_t gen = UINT64_MAX)
 {
     static std::vector<uint8_t> last[3];
     static VkDeviceSize lastAt[3];
-    static uint64_t lastFrame[3];
+    static uint64_t lastFrame[3], lastGen[3] = { UINT64_MAX, UINT64_MAX, UINT64_MAX };
     auto& l = last[slot];
-    if (lastFrame[slot] == s_frameId && l.size() == size && !memcmp(l.data(), data, size))
-        return lastAt[slot];
+    if (lastFrame[slot] == s_frameId && l.size() == size)
+    {
+        if (gen != UINT64_MAX && gen == lastGen[slot]) return lastAt[slot];
+        if (!memcmp(l.data(), data, size)) { lastGen[slot] = gen; return lastAt[slot]; }
+    }
     l.assign((const uint8_t*)data, (const uint8_t*)data + size);
     lastFrame[slot] = s_frameId;
+    lastGen[slot] = gen;
     return lastAt[slot] = Upload(data, size, 256);
 }
 
@@ -551,7 +558,7 @@ struct VertexLayout
     bool packedNormal = false;    // normale compressée 11-11-10 (constante de spécialisation R11G11B10_NORMAL)
 };
 
-static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
+static bool DecodeVertexLayoutUncached(const uint32_t* regs, VertexLayout& layout)
 {
     bool ok = true;
     // Un mini-fetch (dword 1 bit 30) n'a ni constante de fetch ni pas : il reprend ceux du dernier fetch complet
@@ -638,6 +645,24 @@ static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
         layout.attributes[layout.attributeCount++] = { location, binding, vk, uint32_t(offset * 4) };
     });
     return ok;
+}
+
+// La disposition ne dépend que du microcode du vertex shader (formats, pas, constantes de fetch, emplacements) :
+// mémorisée par microcode, au lieu d'être recalculée à chaque dessin sur le thread GPU
+static bool DecodeVertexLayout(const uint32_t* regs, VertexLayout& layout)
+{
+    struct Entry { VertexLayout layout; bool ok; };
+    static std::unordered_map<uint64_t, Entry> cache;
+    uint64_t h = XXH3_64bits(s_vsUcode.data(), s_vsUcode.size()) ^ s_vs->containerHash;
+    auto it = cache.find(h);
+    if (it == cache.end())
+    {
+        Entry e{};
+        e.ok = DecodeVertexLayoutUncached(regs, e.layout);
+        it = cache.emplace(h, e).first;
+    }
+    layout = it->second.layout;
+    return it->second.ok;
 }
 
 static VkPipeline GetPipeline(const uint32_t* regs, const VertexLayout& layout, VkPrimitiveTopology topology, uint32_t spec, bool depthOnly)
@@ -927,7 +952,7 @@ static uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitchAligned, uint32_t 
     return ((y & 1) << 4) | (pipe << 6) | (bank << 11) | (bytes & 15) | (((bytes >> 4) & 1) << 5) | (((bytes >> 5) & 7) << 8) | ((bytes >> 8) << 12);
 }
 
-struct CachedTexture { Image image, staging; uint32_t descriptor = 0, levels = 1; uint64_t contentHash = 0; };
+struct CachedTexture { Image image, staging; uint32_t descriptor = 0, levels = 1; uint64_t contentHash = 0, checkedFrame = UINT64_MAX; };
 
 VkPhysicalDevice VulkanPhysicalDevice();
 
@@ -1002,10 +1027,13 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
     uint32_t srcSize = tiled ? pitchAligned * heightAligned * info.bytesPerBlock : pitchBlocks * bh * info.bytesPerBlock;
     const uint8_t* src = g_base + phys(base);
 
+    // Contenu vérifié une fois par image : re-hacher toute la texture à chaque dessin occupait le thread GPU
+    // (chapitre 2 à 30 img/s sur Steam Deck, des centaines de dessins sur les mêmes textures)
     uint64_t key = XXH3_64bits(f, 24);
-    uint64_t content = XXH3_64bits(src, srcSize);
     auto it = s_textures.find(key);
-    if (it != s_textures.end() && it->second.contentHash == content) return it->second.descriptor;
+    if (it != s_textures.end() && it->second.checkedFrame == s_frameId) return it->second.descriptor;
+    uint64_t content = XXH3_64bits(src, srcSize);
+    if (it != s_textures.end() && it->second.contentHash == content) { it->second.checkedFrame = s_frameId; return it->second.descriptor; }
 
     // Dé-tuilage + remise en ordre des octets dans le tampon d'envoi
     EndRenderPass();
@@ -1083,7 +1111,7 @@ static uint32_t GetTexture(const uint32_t* f, uint32_t (*phys)(uint32_t))
         if (drawLog)
             KLOG("texture %ux%u format %u %s swizzle %03X -> descripteur %u", width, height, format, tiled ? "tuilée" : "linéaire", sw, t.descriptor);
     }
-    t.contentHash = content;
+    t.contentHash = content; t.checkedFrame = s_frameId;
     Transition(t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy copy{};
     copy.bufferOffset = at;
@@ -1323,11 +1351,11 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         float c[1024];
         memcpy(c, regs + ALU_CONSTANTS, 4096);
         for (int i = 0; i < 4; i++) c[i] *= float(kFieldWidth) / float(kWideWidth);
-        vsConst = UploadConstants(0, c, 4096);
+        vsConst = UploadConstants(0, c, 4096, g_constGen[0] * 2 + 1);
     }
     else
-        vsConst = UploadConstants(0, regs + ALU_CONSTANTS, 4096);
-    VkDeviceSize psConst = UploadConstants(1, regs + ALU_CONSTANTS + 256 * 4, 3584);
+        vsConst = UploadConstants(0, regs + ALU_CONSTANTS, 4096, g_constGen[0] * 2);
+    VkDeviceSize psConst = UploadConstants(1, regs + ALU_CONSTANTS + 256 * 4, 3584, g_constGen[1]);
     uint8_t shared[1024]{};   // indices de descripteurs (0 = texture de remplacement), booléens, seuil alpha, boucles
     // Textures du pixel shader : l'échantillonneur n lit la fetch constant n ; indices 2D en c0-c3, samplers en c12-c15
     for (uint32_t slot = 0; slot < 16; slot++)
@@ -1428,8 +1456,17 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         int32_t x1 = S(scissor.offset.x + int32_t(scissor.extent.width)), y1 = S(scissor.offset.y + int32_t(scissor.extent.height));
         scissor = { { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
     }
-    vkCmdSetViewport(s_cmd, 0, 1, &viewport);
-    vkCmdSetScissor(s_cmd, 0, 1, &scissor);
+    // État déjà en place depuis le dessin précédent du même command buffer : pas de nouvel appel. Sous Proton
+    // chaque appel Vulkan traverse winevulkan, premier poste du thread GPU au chapitre 2 sur Steam Deck
+    uint64_t VulkanRecordEpoch();
+    static uint64_t stateEpoch = UINT64_MAX;
+    static VkViewport lastViewport;
+    static VkRect2D lastScissor;
+    static VkPipeline lastPipeline;
+    bool fresh = stateEpoch != VulkanRecordEpoch();
+    if (fresh) { stateEpoch = VulkanRecordEpoch(); lastPipeline = VK_NULL_HANDLE; }
+    if (fresh || memcmp(&viewport, &lastViewport, sizeof viewport)) { vkCmdSetViewport(s_cmd, 0, 1, &viewport); lastViewport = viewport; }
+    if (fresh || memcmp(&scissor, &lastScissor, sizeof scissor)) { vkCmdSetScissor(s_cmd, 0, 1, &scissor); lastScissor = scissor; }
     {
         // Débogage : IKARUGA_PASSLOG=n -> structure de l'image n (cible, shaders, viewport, textures copiées lues)
         extern uint64_t g_presentCount;
@@ -1451,8 +1488,8 @@ void RenderDraw(const uint32_t* regs, uint32_t initiator, uint32_t (*phys)(uint3
         }
     }
 
-    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipelineLayout, 0, 4, s_sets, 0, nullptr);
+    if (pipeline != lastPipeline) { vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); lastPipeline = pipeline; }
+    if (fresh) vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pipelineLayout, 0, 4, s_sets, 0, nullptr);
     vkCmdPushConstants(s_cmd, s_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
     if (layout.bindingCount) vkCmdBindVertexBuffers(s_cmd, 0, layout.bindingCount, buffers, offsets);
     if (!indices.empty())
