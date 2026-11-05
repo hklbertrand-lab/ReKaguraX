@@ -24,6 +24,9 @@ cmake --build build/XenonRecomp
 cmake -S thirdparty/XenosRecomp -B build/XenosRecomp -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DXENOS_RECOMP_DXIL=OFF \
     -DCMAKE_CXX_FLAGS="$FLAGS -include atomic -include algorithm -include execution -fexperimental-library"
 cmake --build build/XenosRecomp
+XU=thirdparty/XenonRecomp/XenonUtils
+clang++ -std=c++20 -O2 $FLAGS -I$XU -Ithirdparty/XenonRecomp/thirdparty/simde tools/xex_dump.cpp build/XenonRecomp/XenonUtils/libXenonUtils.a -o build/xex_dump
+mkdir -p ppc build/shaders/in
 
 # 1) Code : tables de switch puis PPC -> C++
 build/XenonRecomp/XenonAnalyse/XenonAnalyse extracted/default.xex config/ikaruga_switch_tables.toml

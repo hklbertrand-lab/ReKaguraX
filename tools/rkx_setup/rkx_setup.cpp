@@ -294,7 +294,7 @@ static bool WriteNinja(const fs::path& kit, const fs::path& work, const fs::path
 #else
     n << "rule link\n  command = $cxx $in -o $out " << Fwd(src / "lib" / "libXenonUtils.a") << " " << Fwd(src / "lib" / "libdisasm.a") << " "
       << Fwd(src / "lib" / "libzstd.a") << " " << Fwd(src / "lib" / "libavcodec.a") << " " << Fwd(src / "lib" / "libavutil.a") << " "
-      << "-L" << Fwd(src / "lib") << " -lSDL3 -Wl,-rpath,'$$ORIGIN' -static-libstdc++ -pthread -lm -ldl\n  description = édition des liens\n";
+      << "-L" << Fwd(src / "lib") << " -lSDL3 -Wl,-rpath,'$$ORIGIN' -pthread -lm -ldl\n  description = édition des liens\n";
 #endif
     std::vector<std::string> objs;
     auto add = [&](const fs::path& f, const char* rule, const std::string& extra = "") {
@@ -423,6 +423,15 @@ static void LaunchGame()
 int main(int argc, char** argv)
 {
     s_kit = fs::path(SDL_GetBasePath());
+#ifndef _WIN32
+    // ld.lld du kit a besoin de libxml2/ICU (toolchain/ldlibs) et XenosRecomp de libdxcompiler.so (bin/)
+    {
+        std::string lp = Fwd(s_kit / "toolchain" / "ldlibs") + ":" + Fwd(s_kit / "bin");
+        if (const char* old = getenv("LD_LIBRARY_PATH"); old && *old) lp += std::string(":") + old;
+        setenv("LD_LIBRARY_PATH", lp.c_str(), 1);
+        SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "LD_LIBRARY_PATH", lp.c_str(), true);
+    }
+#endif
     // Mode sans fenêtre (tests, scripts) : rkx-setup --headless <paquet>
     if (argc > 2 && !strcmp(argv[1], "--headless")) { s_package = argv[2]; return Install() ? 0 : 1; }
     if (!SDL_Init(SDL_INIT_VIDEO)) return 1;
