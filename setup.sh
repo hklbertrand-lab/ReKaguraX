@@ -5,6 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 mkdir -p thirdparty build
+RT="$(cd ../Xbox360Runtime && pwd)"   # runtime commun (dossier frère)
 
 clone() { [ -d "thirdparty/$1" ] || git clone --recursive $3 "$2" "thirdparty/$1"; }
 clone XenonRecomp    https://github.com/hedge-dev/XenonRecomp
@@ -13,8 +14,8 @@ clone Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers "--depth 1 -
 clone volk           https://github.com/zeux/volk "--depth 1 --branch 1.4.304"
 
 # Patches locaux (instructions VMX ajoutées, adaptations aux shaders d'Ikaruga)
-git -C thirdparty/XenonRecomp apply --check ../../patches/xenonrecomp-ikaruga.patch 2>/dev/null && git -C thirdparty/XenonRecomp apply ../../patches/xenonrecomp-ikaruga.patch
-git -C thirdparty/XenosRecomp apply --check ../../patches/xenosrecomp-ikaruga.patch 2>/dev/null && git -C thirdparty/XenosRecomp apply ../../patches/xenosrecomp-ikaruga.patch
+git -C thirdparty/XenonRecomp apply --check "$RT/patches/xenonrecomp.patch" 2>/dev/null && git -C thirdparty/XenonRecomp apply "$RT/patches/xenonrecomp.patch"
+git -C thirdparty/XenosRecomp apply --check "$RT/patches/xenosrecomp.patch" 2>/dev/null && git -C thirdparty/XenosRecomp apply "$RT/patches/xenosrecomp.patch"
 
 FLAGS="-include cstdlib -include cstring"
 cmake -S thirdparty/XenonRecomp -B build/XenonRecomp -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS="$FLAGS"
@@ -26,7 +27,7 @@ cmake --build build/XenosRecomp
 # 1) Code : tables de switch puis PPC -> C++
 build/XenonRecomp/XenonAnalyse/XenonAnalyse extracted/default.xex config/ikaruga_switch_tables.toml
 (cd config && ../build/XenonRecomp/XenonRecomp/XenonRecomp ikaruga.toml ../thirdparty/XenonRecomp/XenonUtils/ppc_context.h)
-python runtime/gen_stubs.py ppc/ppc_recomp_shared.h runtime/kernel.cpp runtime/imports_stub.cpp
+python "$RT/tools/gen_stubs.py" ppc/ppc_recomp_shared.h "$RT/src/kernel.cpp" game/imports_stub.cpp
 
 # 2) Shaders : image déchiffrée -> HLSL -> SPIR-V
 build/xex_dump extracted/default.xex build/shaders/in/default.bin 2>/dev/null || true

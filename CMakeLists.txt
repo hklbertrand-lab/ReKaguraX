@@ -19,9 +19,6 @@ if(WIN32)
 endif()
 find_package(SDL3 REQUIRED CONFIG)
 
-file(GLOB PPC_SOURCES ${CMAKE_SOURCE_DIR}/ppc/*.cpp)
-file(GLOB RUNTIME_SOURCES ${CMAKE_SOURCE_DIR}/runtime/*.cpp)
-
 # zstd + smol-v (fournis avec XenosRecomp) pour décompresser le cache SPIR-V
 set(XENOS_THIRDPARTY ${CMAKE_SOURCE_DIR}/thirdparty/XenosRecomp/thirdparty)
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
@@ -29,30 +26,9 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${XENOS_THIRDPARTY}/zstd/build/cmake ${CMAKE_BINARY_DIR}/zstd EXCLUDE_FROM_ALL)
 
-add_executable(ikaruga ${RUNTIME_SOURCES} ${PPC_SOURCES}
-    ${CMAKE_SOURCE_DIR}/thirdparty/volk/volk.c
-    ${CMAKE_SOURCE_DIR}/build/shaders/shader_cache.cpp
-    ${XENOS_THIRDPARTY}/smol-v/source/smolv.cpp)
-target_include_directories(ikaruga PRIVATE
-    ${CMAKE_SOURCE_DIR}/ppc
-    ${CMAKE_SOURCE_DIR}/runtime
-    ${CMAKE_SOURCE_DIR}/thirdparty/XenonRecomp/thirdparty/simde
-    ${CMAKE_SOURCE_DIR}/thirdparty/volk
-    ${CMAKE_SOURCE_DIR}/thirdparty/Vulkan-Headers/include
-    ${XENOS_THIRDPARTY}/smol-v/source
-    ${XENOS_THIRDPARTY}/xxHash
-    ${XENOS_THIRDPARTY}/zstd/lib)
-target_compile_definitions(ikaruga PRIVATE VK_NO_PROTOTYPES)
-# FFmpeg réduit au décodeur XMA (thirdparty/ffmpeg-build, voir setup.sh)
-set(FFMPEG_BUILD ${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg-build)
-target_include_directories(ikaruga PRIVATE ${CMAKE_SOURCE_DIR}/thirdparty/ffmpeg-include)
-target_link_libraries(ikaruga PRIVATE ${FFMPEG_BUILD}/libavcodec/libavcodec.a ${FFMPEG_BUILD}/libavutil/libavutil.a $<$<PLATFORM_ID:Windows>:bcrypt>)
-target_link_libraries(ikaruga PRIVATE XenonUtils SDL3::SDL3 libzstd_static $<$<PLATFORM_ID:Windows>:winmm>)
-target_compile_options(ikaruga PRIVATE -march=x86-64-v3 -Wno-unused-label -Wno-unused-variable)
-target_link_options(ikaruga PRIVATE -Wl,-Map=${CMAKE_BINARY_DIR}/ikaruga.map)
-set_source_files_properties(${PPC_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-include;${CMAKE_SOURCE_DIR}/runtime/mmio.h")
+# Runtime Xbox 360 commun (noyau, GPU Xenos -> Vulkan, audio XMA, réglages) : dossier frère, ou X360_RUNTIME_DIR
+set(X360_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../Xbox360Runtime CACHE PATH "Dossier de Xbox360Runtime")
+include(${X360_RUNTIME_DIR}/runtime.cmake)
 
-if(WIN32)
-    add_custom_command(TARGET ikaruga POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:SDL3::SDL3> $<TARGET_FILE_DIR:ikaruga>)
-endif()
+file(GLOB GAME_SOURCES ${CMAKE_SOURCE_DIR}/game/*.cpp)
+x360_add_game(ikaruga GAME_DIR ${CMAKE_SOURCE_DIR} SOURCES ${GAME_SOURCES})

@@ -96,13 +96,13 @@ PPC_FUNC(sub_82102080)
 {
     static int n;
     uint32_t o = ctx.r3.u32;
-    if (getenv("IKARUGA_ESRBLOG") && n++ % 60 == 0)
+    if (GameEnv("ESRBLOG") && n++ % 60 == 0)
     {
         float f64; uint32_t v = Rd32(o + 64); memcpy(&f64, &v, 4);
         KLOG("ESRB obj=%08X étape48=%u o49=%u état=%u,%u,%u,%u +64=%.3f +68=%08X +40=%08X +44=%08X", o, Rd8(o + 48), Rd8(o + 49), Rd8(o + 50), Rd8(o + 51), Rd8(o + 52), Rd8(o + 53),
             f64, Rd32(o + 68), Rd32(o + 40), Rd32(o + 44));
     }
-    if (getenv("IKARUGA_ESRBLOG") && n % 60 == 1)
+    if (GameEnv("ESRBLOG") && n % 60 == 1)
     {
         uint32_t g = Rd32(0x827C0CD4), sys = Rd32(g + 2596);
         KLOG("  sous-système [g+2596]=%08X vtable=%08X occupé(+112)=%u +100..+120: %08X %08X %08X %08X %08X %08X", sys, Rd32(sys), Rd8(sys + 112),
@@ -120,7 +120,7 @@ PPC_FUNC(sub_82161A20)
     static int n;
     uint32_t dev = ctx.r3.u32;
     static auto last = std::chrono::steady_clock::now();
-    if (getenv("IKARUGA_FENCELOG") && std::chrono::steady_clock::now() - last > std::chrono::seconds(2) && (last = std::chrono::steady_clock::now(), true))
+    if (GameEnv("FENCELOG") && std::chrono::steady_clock::now() - last > std::chrono::seconds(2) && (last = std::chrono::steady_clock::now(), true))
         KLOG("attente fence : cible=%08X dernière=%08X gpu=%08X +13232=%08X r5=%08X", ctx.r4.u32, Rd32(dev + 10908),
             Rd32(Rd32(dev + 10896)), Rd32(dev + 13232), ctx.r5.u32);
     __imp__sub_82161A20(ctx, base);
@@ -130,7 +130,7 @@ PPC_FUNC(sub_82161A20)
 extern "C" PPC_FUNC(__imp__sub_82170B28);
 PPC_FUNC(sub_82170B28)
 {
-    static bool on = getenv("IKARUGA_LOCKLOG");
+    static bool on = GameEnv("LOCKLOG");
     uint32_t w = ctx.r3.u32, sh = Rd32(w);
     uint32_t cpu = Rd8(ctx.r13.u32 + 0x10C);
     if (on) KLOG("82170B28 entrée cpu%u ctx=%08X verrou=%u masque=%08X compteur=%u file=%u/%u", cpu, w, Rd32(sh), Rd32(sh + 56), Rd32(sh + 60), Rd32(w + 60), Rd32(w + 56));
@@ -144,7 +144,7 @@ extern "C" PPC_FUNC(__imp__sub_82171348);
 PPC_FUNC(sub_82171348)
 {
     uint32_t dev = ctx.r3.u32, flags = Rd32(dev + 22300);
-    if (getenv("IKARUGA_NOD3DWORKERS"))   // test : D3D sans threads de travail (bloque plus tôt)
+    if (GameEnv("NOD3DWORKERS"))   // test : D3D sans threads de travail (bloque plus tôt)
     {
         KLOG("D3D : threads de travail désactivés (device+22300 %08X -> %08X)", flags, flags & ~0x3F000000u);
         Wr32(dev + 22300, flags & ~0x3F000000u);
@@ -156,7 +156,7 @@ PPC_FUNC(sub_82171348)
 extern "C" PPC_FUNC(__imp__sub_82170FB8);
 PPC_FUNC(sub_82170FB8)
 {
-    static bool on = getenv("IKARUGA_QUEUELOG");
+    static bool on = GameEnv("QUEUELOG");
     uint32_t cpu = Rd8(ctx.r13.u32 + 0x10C), q = 0x40004EBC + cpu * 80;
     static uint32_t maxDepth, calls;
     uint32_t depth = Rd32(q + 56) - Rd32(q + 60);
@@ -171,7 +171,7 @@ PPC_FUNC(sub_82170FB8)
 extern "C" PPC_FUNC(__imp__sub_8252F540);
 PPC_FUNC(sub_8252F540)
 {
-    static bool dump = getenv("IKARUGA_GLYPHDUMP");
+    static bool dump = GameEnv("GLYPHDUMP");
     static int n;
     uint32_t s = ctx.r3.u32;
     uint32_t src = Rd32(s), dst = Rd32(s + 4), srcPitch = Rd32(s + 8), dstPitch = Rd32(s + 12), h = Rd16(s + 18), w = Rd32(s + 36), rows = Rd32(s + 28), total = Rd32(s + 32);
@@ -191,7 +191,7 @@ PPC_FUNC(sub_8252F540)
 extern "C" PPC_FUNC(__imp__sub_82537798);
 PPC_FUNC(sub_82537798)
 {
-    static bool dump = getenv("IKARUGA_GLYPHDUMP");
+    static bool dump = GameEnv("GLYPHDUMP");
     static int n;
     if (dump && n < 400)
     {
